@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+public/
+dist/
+.playwright/
+data/prefectures_*.json
+!data/prefectures_latest.json

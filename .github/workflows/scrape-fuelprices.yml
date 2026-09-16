@@ -1,0 +1,58 @@
+name: Scrape Station Fuel Prices & Deploy API
+
+on:
+  schedule:
+    # 14:00 EEST is 11:00 UTC (runs daily)
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fuelprices-station-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape-stations:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium with system dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Execute station scraper
+        run: node scraper.js
+
+      - name: Prepare static files for GitHub Pages
+        run: |
+          mkdir -p public/data
+          # Copy to /data/stations_latest.min.json
+          cp data/stations_latest.min.json public/data/stations_latest.min.json
+          # Also expose at root /stations_latest.min.json for direct access
+          cp data/stations_latest.min.json public/stations_latest.min.json
+          # Prevent Jekyll from bypassing files or folders
+          touch public/.nojekyll
+
+      - name: Commit and push to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          keep_files: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Automated station fuel prices update [skip ci]'
