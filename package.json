@@ -1,7 +1,7 @@
 {
   "name": "fuelprices-station-scraper",
   "version": "1.0.0",
-  "description": "Scrapes Greek station-level fuel prices from fuelprices.gr with stealth Playwright and outputs minified static JSON API",
+  "description": "Scrapes Greek station-level fuel prices via fuelgr.gr web API and outputs minified static JSON for GitHub Releases",
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js",
