@@ -5,7 +5,8 @@
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js",
-    "scrape": "node scraper.js"
+    "scrape": "node scraper.js",
+    "scrape:reviews": "node reviews_scraper.js"
   },
   "dependencies": {
     "playwright": "^1.40.0"
