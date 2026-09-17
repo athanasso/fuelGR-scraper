@@ -35,6 +35,14 @@ const ALL_BRAND_IDS = [
 const MIN_PRICE = 0.4;
 const MAX_PRICE = 5.0;
 
+/**
+ * Fuel type IDs to request per grid point.
+ * Web API returns ONLY the selected fuel type (`f`) per call, so we must
+ * scan each type separately and merge by station id. Matches app keys:
+ * 1=u95, 2=u100, 4=d, 5=dh, 6=lpg
+ */
+const SCAN_FUEL_TYPES = [1, 2, 4, 5, 6];
+
 function uuid() {
   return crypto.randomUUID();
 }
@@ -92,10 +100,18 @@ function unscrambleResponse(raw) {
 function generateScanGrid() {
   const points = new Map();
 
-  const addPoint = (lat, lng, fuelType = 1) => {
-    const key = `${lat.toFixed(3)}_${lng.toFixed(3)}_${fuelType}`;
-    if (!points.has(key)) {
-      points.set(key, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)), fuelType });
+  /** Register lat/lng for every fuel type the app can display. */
+  const addPoint = (lat, lng, fuelTypes = SCAN_FUEL_TYPES) => {
+    const types = Array.isArray(fuelTypes) ? fuelTypes : [fuelTypes];
+    for (const fuelType of types) {
+      const key = `${lat.toFixed(3)}_${lng.toFixed(3)}_${fuelType}`;
+      if (!points.has(key)) {
+        points.set(key, {
+          lat: Number(lat.toFixed(4)),
+          lng: Number(lng.toFixed(4)),
+          fuelType
+        });
+      }
     }
   };
 
@@ -160,7 +176,7 @@ function generateScanGrid() {
     }
   }
 
-  // 3. Regional capitals — also scan LPG (f=6) to catch Autogas-only sites
+  // 3. Regional capitals (same multi-fuel scan as the base grid)
   const REGIONAL_CENTERS = [
     [37.9838, 23.7275], [40.6401, 22.9444], [38.2466, 21.7346], [35.3387, 25.1442],
     [39.6390, 22.4191], [39.3622, 22.9422], [39.6650, 20.8537], [37.0389, 22.1142],
@@ -181,8 +197,7 @@ function generateScanGrid() {
   ];
 
   for (const [cLat, cLng] of REGIONAL_CENTERS) {
-    addPoint(cLat, cLng, 1);
-    addPoint(cLat, cLng, 6);
+    addPoint(cLat, cLng);
   }
 
   return Array.from(points.values());
@@ -396,16 +411,21 @@ async function main() {
   const stations = await processGridConcurrently(grid, 12);
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
 
-  // Sanity: typical Greece unleaded median should be well below honeypot spikes
-  const u95 = stations
-    .map((s) => (s.fuels && s.fuels['1'] ? s.fuels['1'].price : s.price))
-    .filter((p) => typeof p === 'number' && p >= MIN_PRICE && p <= MAX_PRICE)
-    .sort((a, b) => a - b);
-  if (u95.length > 0) {
-    const median = u95[Math.floor(u95.length / 2)];
-    console.log(
-      `Unleaded 95 price check: n=${u95.length} min=${u95[0]} median=${median} max=${u95[u95.length - 1]}`
-    );
+  // Per-fuel coverage + price sanity (web API is single-fuel per request)
+  const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg' };
+  for (const fid of Object.keys(FUEL_LABELS)) {
+    const prices = stations
+      .map((s) => (s.fuels && s.fuels[fid] ? s.fuels[fid].price : null))
+      .filter((p) => typeof p === 'number' && p >= MIN_PRICE && p <= MAX_PRICE)
+      .sort((a, b) => a - b);
+    if (prices.length === 0) {
+      console.log(`Fuel ${FUEL_LABELS[fid]} (${fid}): 0 stations with price`);
+    } else {
+      const median = prices[Math.floor(prices.length / 2)];
+      console.log(
+        `Fuel ${FUEL_LABELS[fid]} (${fid}): n=${prices.length} min=${prices[0]} median=${median} max=${prices[prices.length - 1]}`
+      );
+    }
   }
 
   if (stations.length < 1000) {

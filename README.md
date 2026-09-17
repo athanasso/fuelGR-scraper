@@ -25,7 +25,7 @@ Your mobile application can fetch the latest dataset directly using the GitHub R
 The automated workflow [`.github/workflows/update-database.yml`](.github/workflows/update-database.yml) runs every day at **14:00 EEST (11:00 UTC)**:
 
 1. **`scraper.py`**: Fetches and parses today's official government PDF bulletin (`IMERISIO_DELTIO_ANA_NOMO_*.pdf`) using font regex heuristics, outputting prefecture fuel averages for Unleaded 95, Unleaded 100, Diesel, and LPG.
-2. **`scraper.js`**: Scrapes 4,700+ stations nationwide via the public web API (`fuelgr.gr/web/api/data.php`) using a mocked browser `localStorage` payload and geospatial grid scan. Avoids the Android `get_data_v4.php` endpoint, which returns honeypot (scrambled) data to unrecognized clients.
+2. **`scraper.js`**: Scrapes 4,700+ stations nationwide via the public web API (`fuelgr.gr/web/api/data.php`) using a mocked browser `localStorage` payload and geospatial grid scan. Each grid point is queried for Unleaded 95, Unleaded 100, Diesel, Heating Diesel, and LPG (the web API returns only one fuel type per request). Avoids the Android `get_data_v4.php` endpoint, which returns honeypot (scrambled) data to unrecognized clients.
 3. **`package_dataset.py`**: Minifies JSON, compresses `.zst` files with `zstandard`, and generates `release_notes.md` + `tag.txt`.
 4. **GitHub Releases**: Publishes / updates release with date tag (e.g. `2026-09-17`) marked `--latest` via `gh release`.
 
