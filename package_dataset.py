@@ -428,9 +428,16 @@ def main():
         path = dist_dir / name
         return format_bytes(path.stat().st_size) if path.exists() else "n/a"
 
-    stations_min_size = asset_size("stations_latest.min.json")
-    stations_zst_size = asset_size("stations_latest.min.json.zst")
-    ledger_size = asset_size("price_ledger.min.json")
+    # Keep this table in sync with ASSETS uploaded in .github/workflows/update-database.yml
+    dl = "https://github.com/athanasso/fuelGR-scraper/releases/latest/download"
+    reviews_path = dist_dir / "reviews.min.json"
+    reviews_count = 0
+    if reviews_path.exists():
+        try:
+            with open(reviews_path, "r", encoding="utf-8") as f_rev_count:
+                reviews_count = len(json.load(f_rev_count))
+        except Exception:
+            reviews_count = 0
 
     release_notes = f"""## FuelGR Daily Dataset Release [{tag}]
 
@@ -445,20 +452,24 @@ Automated daily fuel prices dataset snapshot for Greece.
 - **Stations with Diesel (`d`):** {fuel_counts['d']:,}
 - **Stations with LPG (`lpg`):** {fuel_counts['lpg']:,}
 - **Stations with Heating Diesel (`dh`):** {fuel_counts['dh']:,}
-- **Schema:** Real daily price ledger → 7-day deltas (`d7`) and 14-day sparklines (`sp`).
+- **Stations with Google Reviews:** {reviews_count:,}
+- **Schema:** Real daily price ledger → 7-day deltas (`d7`) and ledger-based sparklines (`sp`).
 
 ### Direct Download Links
 The following assets can be fetched directly by mobile clients via GitHub Release CDN:
 
 | File | Format | Size | Description |
 |---|---|---|---|
-| [`stations_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json) | JSON (Minified) | {stations_min_size} | Daily master: {station_count:,} stations with prices, `d7` deltas, and ledger-based sparklines |
-| [`stations_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json.zst) | Zstandard | {stations_zst_size} | High-compression master dataset |
-| [`price_ledger.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json) | JSON (Minified) | {ledger_size} | **Source of truth for charts** — real per-station daily prices (grows each scrape) |
-| [`price_ledger.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json.zst) | Zstandard | {asset_size("price_ledger.min.json.zst")} | Compressed price ledger |
-| [`prefectures_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json) | JSON (Minified) | {asset_size("prefectures_latest.min.json")} | Prefecture regional price averages |
-| [`prefectures_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json.zst) | Zstandard | {asset_size("prefectures_latest.min.json.zst")} | Compressed prefecture averages |
-| [`prefectures_latest.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.json) | JSON | {asset_size("prefectures_latest.json")} | Human-readable prefecture averages |
+| [`stations_latest.min.json`]({dl}/stations_latest.min.json) | JSON (Minified) | {asset_size("stations_latest.min.json")} | Daily master: {station_count:,} stations with prices, `d7` deltas, and ledger-based sparklines |
+| [`stations_latest.min.json.zst`]({dl}/stations_latest.min.json.zst) | Zstandard | {asset_size("stations_latest.min.json.zst")} | High-compression master dataset |
+| [`stations_latest.json`]({dl}/stations_latest.json) | JSON | {asset_size("stations_latest.json")} | Human-readable master stations dataset |
+| [`price_ledger.min.json`]({dl}/price_ledger.min.json) | JSON (Minified) | {asset_size("price_ledger.min.json")} | **Source of truth for charts** — real per-station daily prices (grows each scrape) |
+| [`price_ledger.min.json.zst`]({dl}/price_ledger.min.json.zst) | Zstandard | {asset_size("price_ledger.min.json.zst")} | Compressed price ledger |
+| [`reviews.min.json`]({dl}/reviews.min.json) | JSON (Minified) | {asset_size("reviews.min.json")} | Google rating + review counts by station id ({reviews_count:,} stations) |
+| [`reviews.min.json.zst`]({dl}/reviews.min.json.zst) | Zstandard | {asset_size("reviews.min.json.zst")} | Compressed Google reviews map |
+| [`prefectures_latest.min.json`]({dl}/prefectures_latest.min.json) | JSON (Minified) | {asset_size("prefectures_latest.min.json")} | Prefecture regional price averages |
+| [`prefectures_latest.min.json.zst`]({dl}/prefectures_latest.min.json.zst) | Zstandard | {asset_size("prefectures_latest.min.json.zst")} | Compressed prefecture averages |
+| [`prefectures_latest.json`]({dl}/prefectures_latest.json) | JSON | {asset_size("prefectures_latest.json")} | Human-readable prefecture averages |
 
 *Generated automatically by [fuelGR-scraper](https://github.com/athanasso/fuelGR-scraper).*
 """
