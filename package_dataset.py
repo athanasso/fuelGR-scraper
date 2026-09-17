@@ -424,9 +424,9 @@ The following assets can be fetched directly by mobile clients via GitHub Releas
 
 | File | Format | Size | Description |
 |---|---|---|---|
-| [`stations_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json) | JSON (Minified) | {stations_min_size} | Daily master: {station_count:,} stations with prices, 7d trends, and 14d sparklines |
+| [`stations_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json) | JSON (Minified) | {stations_min_size} | Daily master: {station_count:,} stations with prices, `d7` deltas, and ledger-based sparklines |
 | [`stations_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json.zst) | Zstandard | {stations_zst_size} | High-compression master dataset |
-| [`price_ledger.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json) | JSON (Minified) | {ledger_size} | Real per-station daily price history (rolling) |
+| [`price_ledger.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json) | JSON (Minified) | {ledger_size} | **Source of truth for charts** — real per-station daily prices (grows each scrape) |
 | [`price_ledger.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json.zst) | Zstandard | {asset_size("price_ledger.min.json.zst")} | Compressed price ledger |
 | [`prefectures_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json) | JSON (Minified) | {asset_size("prefectures_latest.min.json")} | Prefecture regional price averages |
 | [`prefectures_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json.zst) | Zstandard | {asset_size("prefectures_latest.min.json.zst")} | Compressed prefecture averages |
