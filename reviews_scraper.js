@@ -230,6 +230,21 @@ async function main() {
 
   // Build work queue (skip already-scraped)
   let queue = stations.filter(s => !results[s.id]);
+
+  // Prioritize major urban centers: Athens/Attica, Piraeus, Thessaloniki, Patras, Heraklion
+  const PRIORITY_PREFS = [
+    'ΑΘΗΝ', 'ΑΤΤΙΚ', 'ΠΕΙΡΑΙ', 'ΘΕΣΣΑΛΟΝΙΚ', 'ΗΡΑΚΛΕΙ', 'ΑΧΑΪ', 'ΛΑΡΙΣ'
+  ];
+  queue.sort((a, b) => {
+    const prefA = (a.prefecture || a.pref || '').toUpperCase();
+    const prefB = (b.prefecture || b.pref || '').toUpperCase();
+    const idxA = PRIORITY_PREFS.findIndex(p => prefA.includes(p));
+    const idxB = PRIORITY_PREFS.findIndex(p => prefB.includes(p));
+    const scoreA = idxA !== -1 ? idxA : 999;
+    const scoreB = idxB !== -1 ? idxB : 999;
+    return scoreA - scoreB;
+  });
+
   if (LIMIT > 0) queue = queue.slice(0, LIMIT);
   console.log(`Queuing ${queue.length} stations with concurrency=${CONCURRENCY}.\n`);
 
