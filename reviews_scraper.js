@@ -31,7 +31,9 @@ const getArg = (flag, def) => {
 };
 const isCI        = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
 const LIMIT       = parseInt(getArg('--limit', isCI ? '50' : '0'), 10);
-const CONCURRENCY = parseInt(getArg('--concurrency', '3'), 10);
+const CONCURRENCY = parseInt(getArg('--concurrency', '1'), 10); // 1 worker = looks like normal human browsing
+const DELAY_MIN   = parseInt(getArg('--delay-min', '6000'), 10); // 6s
+const DELAY_MAX   = parseInt(getArg('--delay-max', '12000'), 10); // 12s
 const INPUT_FILE  = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
 const OUTPUT_FILE = path.join(__dirname, 'data', 'reviews.min.json');
 
@@ -82,6 +84,7 @@ async function fetchGoogleReviews(page, stationName, address) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await page.waitForTimeout(2000);
+    try { await page.mouse.wheel(0, 150 + Math.random() * 200); } catch {}
 
     // Check if Google blocked this IP with a CAPTCHA / unusual traffic page
     if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
@@ -207,7 +210,7 @@ async function workerLoop(browser, queue, results, done) {
     // Save incrementally every 10 stations
     if (done.count % 10 === 0) saveReviews(results);
 
-    await jitter(1500, 3000);
+    await jitter(DELAY_MIN, DELAY_MAX);
   }
 
   await context.close();

@@ -1,0 +1,90 @@
+name: Bi-Weekly Google Reviews Enrichment
+
+on:
+  schedule:
+    # Runs at 03:00 UTC on the 1st and 15th of every month (every 2 weeks)
+    - cron: '0 3 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum stations to scrape in this run (0 for all remaining)'
+        required: false
+        default: '100'
+      concurrency:
+        description: 'Browser contexts in parallel (keep at 1 for anti-bot safety)'
+        required: false
+        default: '1'
+      delay_min:
+        description: 'Minimum jitter delay per station in ms'
+        required: false
+        default: '6000'
+      delay_max:
+        description: 'Maximum jitter delay per station in ms'
+        required: false
+        default: '12000'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fuelgr-reviews-updater
+  cancel-in-progress: false
+
+jobs:
+  scrape-reviews:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Download latest stations snapshot from release
+        run: |
+          mkdir -p data dist
+          curl -sL "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json" -o data/stations_latest.min.json || true
+          curl -sL "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json" -o data/reviews.min.json || true
+
+      - name: Run slow stealth reviews scraper
+        continue-on-error: true
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '100' }}"
+          CONCURRENCY="${{ github.event.inputs.concurrency || '1' }}"
+          DELAY_MIN="${{ github.event.inputs.delay_min || '6000' }}"
+          DELAY_MAX="${{ github.event.inputs.delay_max || '12000' }}"
+          echo "Starting slow scraper with limit=${LIMIT}, concurrency=${CONCURRENCY}, delay=${DELAY_MIN}-${DELAY_MAX}ms..."
+          node reviews_scraper.js --limit "${LIMIT}" --concurrency "${CONCURRENCY}" --delay-min "${DELAY_MIN}" --delay-max "${DELAY_MAX}" --input data/stations_latest.min.json
+
+      - name: Package updated reviews dataset
+        run: python package_dataset.py
+
+      - name: Update GitHub Release Assets with Fresh Reviews
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find latest release tag
+          TAG=$(gh release view --json tagName -q .tagName)
+          echo "Updating assets on release ${TAG}..."
+          if [ -f "dist/reviews.min.json" ]; then
+            gh release upload "${TAG}" "dist/reviews.min.json" "dist/reviews.min.json.zst" "dist/stations_latest.min.json" "dist/stations_latest.min.json.zst" --clobber
+          fi
