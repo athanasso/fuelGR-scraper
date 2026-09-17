@@ -147,6 +147,27 @@ def transform_station_master(raw: dict, today_str: str) -> tuple[dict, dict]:
     return master_item, detailed_history
 
 
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.2f} MB"
+
+
+def count_fuel_coverage(master_stations: list) -> dict:
+    """Count how many master stations have each compact fuel price key."""
+    keys = ("u95", "u100", "d", "lpg", "dh", "cng")
+    counts = {k: 0 for k in keys}
+    for s in master_stations:
+        prices = s.get("p") or {}
+        for k in keys:
+            val = prices.get(k)
+            if isinstance(val, (int, float)) and val > 0:
+                counts[k] += 1
+    return counts
+
+
 def main():
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
@@ -180,13 +201,13 @@ def main():
     # 2. Process Stations into Split Architecture
     station_file = data_dir / "stations_latest.min.json"
     raw_stations = []
+    master_stations = []
     if station_file.exists():
         with open(station_file, "r", encoding="utf-8") as f:
             raw_stations = json.load(f)
 
         print(f"Transforming {len(raw_stations)} stations into compact mobile schema...")
-        master_stations = []
-        
+
         for raw in raw_stations:
             master_item, detail_history = transform_station_master(raw, today)
             master_stations.append(master_item)
@@ -217,10 +238,18 @@ def main():
     with open(tag_file, "w", encoding="utf-8") as f:
         f.write(tag)
 
-    # 4. Generate release_notes.md
+    # 4. Generate release_notes.md (all stats derived from this run's artifacts)
     notes_file = dist_dir / "release_notes.md"
-    station_count = len(raw_stations)
+    station_count = len(master_stations) if master_stations else len(raw_stations)
     pref_count = len(pref_data)
+    fuel_counts = count_fuel_coverage(master_stations)
+
+    def asset_size(name: str) -> str:
+        path = dist_dir / name
+        return format_bytes(path.stat().st_size) if path.exists() else "n/a"
+
+    stations_min_size = asset_size("stations_latest.min.json")
+    stations_zst_size = asset_size("stations_latest.min.json.zst")
 
     release_notes = f"""## FuelGR Daily Dataset Release [{tag}]
 
@@ -230,19 +259,23 @@ Automated daily fuel prices dataset snapshot for Greece.
 - **Release Date:** {today}
 - **Prefectures Tracked:** {pref_count}
 - **Gas Stations Tracked:** {station_count:,}
-- **Fuel Types:** Unleaded 95 (`u95`), Unleaded 100 (`u100`), Diesel (`d`), LPG (`lpg`), Heating Diesel (`dh`)
+- **Stations with Unleaded 95 (`u95`):** {fuel_counts['u95']:,}
+- **Stations with Unleaded 100 (`u100`):** {fuel_counts['u100']:,}
+- **Stations with Diesel (`d`):** {fuel_counts['d']:,}
+- **Stations with LPG (`lpg`):** {fuel_counts['lpg']:,}
+- **Stations with Heating Diesel (`dh`):** {fuel_counts['dh']:,}
 - **Schema:** Optimized split-file mobile architecture with 7-day deltas (`d7`) and 14-day sparklines (`sp`) embedded.
 
 ### Direct Download Links
 The following assets can be fetched directly by mobile clients via GitHub Release CDN:
 
-| File | Format | Description |
-|---|---|---|
-| [`stations_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json) | JSON (Minified) | Daily Master: 4,779 stations with prices, 7d trends, and 14d sparklines |
-| [`stations_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json.zst) | Zstandard | High-compression master dataset (~180 KB) |
-| [`prefectures_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json) | JSON (Minified) | Prefecture regional price averages |
-| [`prefectures_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json.zst) | Zstandard | Compressed prefecture averages |
-| [`prefectures_latest.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.json) | JSON | Human-readable prefecture averages |
+| File | Format | Size | Description |
+|---|---|---|---|
+| [`stations_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json) | JSON (Minified) | {stations_min_size} | Daily master: {station_count:,} stations with prices, 7d trends, and 14d sparklines |
+| [`stations_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json.zst) | Zstandard | {stations_zst_size} | High-compression master dataset |
+| [`prefectures_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json) | JSON (Minified) | {asset_size("prefectures_latest.min.json")} | Prefecture regional price averages |
+| [`prefectures_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json.zst) | Zstandard | {asset_size("prefectures_latest.min.json.zst")} | Compressed prefecture averages |
+| [`prefectures_latest.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.json) | JSON | {asset_size("prefectures_latest.json")} | Human-readable prefecture averages |
 
 *Generated automatically by [fuelGR-scraper](https://github.com/athanasso/fuelGR-scraper).*
 """
@@ -253,6 +286,10 @@ The following assets can be fetched directly by mobile clients via GitHub Releas
     for item in sorted(dist_dir.iterdir()):
         if item.is_file():
             print(f"  - {item.name} ({item.stat().st_size:,} bytes)")
+    print(
+        "Fuel coverage:",
+        ", ".join(f"{k}={v:,}" for k, v in fuel_counts.items() if v > 0) or "(none)",
+    )
 
 
 if __name__ == "__main__":
