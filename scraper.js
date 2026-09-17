@@ -1,287 +1,286 @@
 /**
- * FuelPrices.gr Station-Level Price Scraper
- * Uses Playwright-Extra + Stealth plugin to bypass anti-bot challenges
- * and intercept raw JSON station & fuel price payloads.
- * Includes resilient fallback for government server outages.
+ * FuelPrices.gr / FuelGR Nationwide Station Price Scraper
+ *
+ * Scrapes all gas stations across Greece (~4,500+ stations) using a
+ * comprehensive geospatial coordinate grid covering all 51 prefectures,
+ * major urban areas, and islands.
+ *
+ * Outputs: data/stations_latest.min.json
  */
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-plugin-stealth')();
 
-chromium.use(stealth);
-
-const TARGET_URL = 'https://www.fuelprices.gr/CheckPrices';
 const OUTPUT_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
 
-const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const AGENT = new https.Agent({
+  keepAlive: true,
+  maxSockets: 30,
+  timeout: 10000
+});
 
-// Major geographic hubs across Greece for fallback scraping when ministry portal has downtime
-const REGIONAL_HUBS = [
-  { lat: 37.9838, lng: 23.7275, name: 'Attica / Athens' },
-  { lat: 40.6401, lng: 22.9444, name: 'Thessaloniki' },
-  { lat: 38.2466, lng: 21.7346, name: 'Patras' },
-  { lat: 35.3387, lng: 25.1442, name: 'Heraklion' },
-  { lat: 39.6390, lng: 22.4191, name: 'Larissa' },
-  { lat: 39.6650, lng: 20.8537, name: 'Ioannina' }
-];
+const API_BASE = 'https://deixto.gr/fuel/get_data_v4.php';
+const API_PARAMS =
+  'dev=android.4.0-b2da2cf97330ca3b&f=1&b=0&d=30&p=0&dSig=google/coral/coral:14/UQ1A.240205.004/1709778835:userdebug/release-keys&iLoc=unknown&apkSig=UPJ2YQunu9eGXu8a/WOiVNAZlYA=';
 
-function normalizeStation(raw) {
-  if (!raw || typeof raw !== 'object') return null;
+/**
+ * Generate nationwide coordinate scan grid covering Greece:
+ * - Base grid across Greek landmass & islands (~0.22 deg step)
+ * - Dense urban sampling for high-density metropolitan areas (~0.04-0.05 deg step)
+ *   (Athens/Attica, Thessaloniki, Patras, Larissa, Heraklion, Chania, Rhodes, etc.)
+ */
+function generateScanGrid() {
+  const points = new Map();
 
-  const rawLat = raw.latitude ?? raw.lat ?? raw.y ?? raw.lt ?? raw.LATITUDE ?? raw.LAT;
-  const rawLng = raw.longitude ?? raw.lng ?? raw.lon ?? raw.x ?? raw.lg ?? raw.LONGITUDE ?? raw.LNG;
-  const lat = parseFloat(String(rawLat || '').replace(',', '.'));
-  const lng = parseFloat(String(rawLng || '').replace(',', '.'));
-
-  const isValidCoord = !isNaN(lat) && !isNaN(lng) && lat >= 34.0 && lat <= 42.5 && lng >= 19.0 && lng <= 30.0;
-
-  let rawPrice = raw.price ?? raw.timi ?? raw.val ?? raw.pr ?? raw.PRICE ?? raw.fuel_price;
-  let price = null;
-  if (rawPrice !== undefined && rawPrice !== null) {
-    const cleanPrice = String(rawPrice).replace(' ', '').replace(',', '.').replace(/[^\d.]/g, '');
-    const num = parseFloat(cleanPrice);
-    if (!isNaN(num) && num > 0) {
-      price = Number(num.toFixed(3));
+  const addPoint = (lat, lng) => {
+    const key = `${lat.toFixed(3)}_${lng.toFixed(3)}`;
+    if (!points.has(key)) {
+      points.set(key, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)) });
     }
-  }
-
-  const id = String(raw.id ?? raw.station_id ?? raw.code ?? raw.prat_id ?? raw.STATION_ID ?? '').trim();
-  const name = String(raw.name ?? raw.ow ?? raw.eponymia ?? raw.title ?? raw.owner ?? 'Πρατήριο Καυσίμων').trim();
-  const brand = String(raw.brand ?? raw.br ?? raw.etaireia ?? raw.marka ?? 'Ανεξάρτητο').trim();
-  const address = String(raw.address ?? raw.ad ?? raw.dieythynsi ?? raw.street ?? raw.mun ?? '').trim();
-  const fuelType = String(raw.fuel_type ?? raw.fuel ?? raw.eidos ?? 'Unleaded 95').trim();
-  const lastUpdated = String(raw.last_updated ?? raw.updated ?? raw.date ?? raw.dt ?? new Date().toISOString().split('T')[0]).split(' ')[0];
-
-  return {
-    id: id || `${lat.toFixed(4)}_${lng.toFixed(4)}`,
-    name: name || brand || 'Πρατήριο Καυσίμων',
-    brand: brand || 'Ανεξάρτητο',
-    address: address || '',
-    latitude: isValidCoord ? Number(lat.toFixed(6)) : null,
-    longitude: isValidCoord ? Number(lng.toFixed(6)) : null,
-    fuel_type: fuelType,
-    price: price,
-    last_updated: lastUpdated
   };
-}
 
-function findStationList(obj) {
-  if (!obj) return [];
-  if (Array.isArray(obj)) {
-    const sample = obj.find((x) => x && typeof x === 'object');
-    if (sample && (sample.lat || sample.latitude || sample.lt || sample.price || sample.pr || sample.name)) {
-      return obj;
-    }
-  }
-  if (typeof obj === 'object') {
-    for (const key of Object.keys(obj)) {
-      const val = obj[key];
-      if (Array.isArray(val) && val.length > 0) {
-        const found = findStationList(val);
-        if (found.length > 0) return found;
-      } else if (typeof val === 'object' && val !== null) {
-        const found = findStationList(val);
-        if (found.length > 0) return found;
+  // 1. Nationwide base grid (lat 34.8 to 41.8, lng 19.5 to 28.3)
+  for (let lat = 34.8; lat <= 41.8; lat += 0.22) {
+    for (let lng = 19.5; lng <= 28.3; lng += 0.25) {
+      // Rough filter to avoid empty open Mediterranean / Ionian seas
+      if (
+        (lat >= 35.0 && lat <= 35.6 && lng >= 23.5 && lng <= 26.3) || // Crete
+        (lat >= 35.8 && lat <= 36.6 && lng >= 27.5 && lng <= 28.3) || // Rhodes / Karpathos
+        (lat >= 36.5 && lat <= 37.8 && lng >= 24.5 && lng <= 26.5) || // Cyclades
+        (lat >= 36.4 && lat <= 38.5 && lng >= 21.0 && lng <= 23.5) || // Peloponnese
+        (lat >= 37.5 && lat <= 39.0 && lng >= 23.0 && lng <= 24.5) || // Attica, Boeotia, Euboea
+        (lat >= 38.0 && lat <= 40.0 && lng >= 20.5 && lng <= 22.5) || // Western Greece, Epirus, Thessaly
+        (lat >= 37.5 && lat <= 40.0 && lng >= 25.5 && lng <= 27.0) || // Lesbos, Chios, Samos, Lemnos
+        (lat >= 39.5 && lat <= 41.8 && lng >= 20.5 && lng <= 26.8) || // Macedonia, Thrace
+        (lat >= 37.6 && lat <= 40.0 && lng >= 19.8 && lng <= 21.0)    // Ionian islands (Corfu, Kefalonia, Zante)
+      ) {
+        addPoint(lat, lng);
       }
     }
   }
-  return [];
+
+  // 2. High-density urban clusters (API caps at 30 stations per 30km circle)
+  // Attica (Athens & surrounding municipalities)
+  for (let lat = 37.80; lat <= 38.25; lat += 0.04) {
+    for (let lng = 23.50; lng <= 24.05; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+
+  // Thessaloniki metropolitan area
+  for (let lat = 40.50; lat <= 40.75; lat += 0.04) {
+    for (let lng = 22.80; lng <= 23.15; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+
+  // Patras
+  for (let lat = 38.18; lat <= 38.30; lat += 0.04) {
+    for (let lng = 21.68; lng <= 21.80; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+
+  // Larissa / Volos
+  for (let lat = 39.30; lat <= 39.68; lat += 0.06) {
+    for (let lng = 22.35; lng <= 23.00; lng += 0.06) {
+      addPoint(lat, lng);
+    }
+  }
+
+  // Heraklion / Chania (Crete)
+  for (let lat = 35.26; lat <= 35.36; lat += 0.04) {
+    for (let lng = 25.08; lng <= 25.18; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+  for (let lat = 35.48; lat <= 35.54; lat += 0.04) {
+    for (let lng = 23.98; lng <= 24.06; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+
+  // Rhodes city
+  for (let lat = 36.38; lat <= 36.46; lat += 0.04) {
+    for (let lng = 28.18; lng <= 28.24; lng += 0.04) {
+      addPoint(lat, lng);
+    }
+  }
+
+  return Array.from(points.values());
 }
 
 /**
- * Fetch raw XML feed from mobile mirror when ministry Tomcat returns 500
+ * Fetch raw XML feed from a single coordinate point
  */
-function fetchHttp(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Dalvik/2.1.0' }, timeout: 15000 }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => resolve(data));
-      res.on('error', reject);
-    }).on('error', reject);
+function fetchCoordinates(lat, lng) {
+  return new Promise((resolve) => {
+    const url = `${API_BASE}?${API_PARAMS}&lat=${lat}&long=${lng}`;
+    const req = https.get(
+      url,
+      {
+        agent: AGENT,
+        headers: {
+          'User-Agent': 'Dalvik/2.1.0',
+          'Accept-Encoding': 'gzip, deflate'
+        },
+        timeout: 9000
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => resolve(data));
+        res.on('error', () => resolve(''));
+      }
+    );
+    req.on('error', () => resolve(''));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve('');
+    });
   });
 }
 
-async function fetchMirrorFallback() {
-  console.log('[*] Activating fallback regional scraping to ensure continuous data feed...');
+/**
+ * Parse stations from XML response
+ */
+function parseXmlStations(xml) {
+  if (!xml || !xml.includes('<gs id=')) return [];
+
   const stations = [];
+  const matches = xml.matchAll(/<gs id="([^"]+)"([^>]*)>([\s\S]*?)<\/gs>/g);
 
-  for (const hub of REGIONAL_HUBS) {
-    const url = `https://deixto.gr/fuel/get_data_v4.php?dev=android.4.0-b2da2cf97330ca3b&lat=${hub.lat}&long=${hub.lng}&f=1&b=0&d=30&p=0&dSig=google/coral/coral:14/UQ1A.240205.004/1709778835:userdebug/release-keys&iLoc=unknown&apkSig=UPJ2YQunu9eGXu8a/WOiVNAZlYA=`;
-    try {
-      const xml = await fetchHttp(url);
-      const matches = xml.matchAll(/<gs id="([^"]+)"[^>]*>([\s\S]*?)<\/gs>/g);
-      for (const m of matches) {
-        const id = m[1];
-        const body = m[2];
-        const lt = (body.match(/<lt>([^<]+)<\/lt>/) || [])[1];
-        const lg = (body.match(/<lg>([^<]+)<\/lg>/) || [])[1];
-        const br = (body.match(/<br[^>]*>([^<]+)<\/br>/) || [])[1];
-        const ad = (body.match(/<ad>([^<]+)<\/ad>/) || [])[1];
-        const ow = (body.match(/<ow>([^<]+)<\/ow>/) || [])[1];
-        const pr = (body.match(/pr="([^"]+)"/) || [])[1];
-        const dt = (body.match(/dt="([^"]+)"/) || [])[1];
+  for (const m of matches) {
+    const id = m[1];
+    const attrs = m[2];
+    const body = m[3];
 
-        if (lt && lg) {
-          stations.push(
-            normalizeStation({
-              id,
-              lt,
-              lg,
-              brand: br,
-              address: ad,
-              owner: ow,
-              price: pr,
-              date: dt,
-              fuel_type: 'Unleaded 95'
-            })
-          );
+    const cnt = (attrs.match(/cnt="([^"]*)"/) || [])[1] || '';
+    const mun = (attrs.match(/mun="([^"]*)"/) || [])[1] || '';
+    const dd = (attrs.match(/dd="([^"]*)"/) || [])[1] || '';
+
+    const lt = (body.match(/<lt>([^<]+)<\/lt>/) || [])[1];
+    const lg = (body.match(/<lg>([^<]+)<\/lg>/) || [])[1];
+    const br = (body.match(/<br[^>]*>([^<]+)<\/br>/) || [])[1] || 'Ανεξάρτητο';
+    const ad = (body.match(/<ad>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ad>/) || [])[1] || '';
+    const ow = (body.match(/<ow>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ow>/) || [])[1] || '';
+
+    // Extract fuels from <fts><ft ...><![CDATA[...]]></ft></fts>
+    const fuels = {};
+    const ftMatches = body.matchAll(/<ft id="(\d+)"[^>]*pr="([^"]+)"[^>]*dt="([^"]*)"[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ft>/g);
+    let primaryPrice = null;
+    let primaryFuel = 'Unleaded 95';
+    let latestDate = '';
+
+    for (const ft of ftMatches) {
+      const ftId = ft[1];
+      const rawPr = parseFloat(ft[2].replace(',', '.'));
+      const ftDt = (ft[3] || '').split(' ')[0];
+      const ftName = (ft[4] || '').trim();
+
+      if (!isNaN(rawPr) && rawPr > 0) {
+        const pr = Number(rawPr.toFixed(3));
+        fuels[ftId] = { name: ftName, price: pr, date: ftDt };
+
+        if (!latestDate || ftDt > latestDate) latestDate = ftDt;
+
+        if (ftId === '1' || ftName.includes('95')) {
+          primaryPrice = pr;
+          primaryFuel = 'Unleaded 95';
+        } else if (!primaryPrice) {
+          primaryPrice = pr;
+          primaryFuel = ftName;
         }
       }
-    } catch (e) {
-      console.warn(`Fallback fetch failed for ${hub.name}:`, e.message);
+    }
+
+    const latNum = parseFloat(lt);
+    const lngNum = parseFloat(lg);
+    const isValidCoord = !isNaN(latNum) && !isNaN(lngNum) && latNum >= 34.0 && latNum <= 42.5 && lngNum >= 19.0 && lngNum <= 30.0;
+
+    if (id && isValidCoord) {
+      stations.push({
+        id: String(id),
+        name: ow.trim() || br.trim() || 'Πρατήριο Καυσίμων',
+        brand: br.trim() || 'Ανεξάρτητο',
+        address: ad.trim(),
+        prefecture: cnt.trim(),
+        municipality: mun.trim(),
+        district: dd.trim(),
+        latitude: Number(latNum.toFixed(6)),
+        longitude: Number(lngNum.toFixed(6)),
+        fuel_type: primaryFuel,
+        price: primaryPrice,
+        fuels: fuels,
+        last_updated: latestDate || new Date().toISOString().split('T')[0]
+      });
     }
   }
 
   return stations;
 }
 
-async function scrape() {
-  console.log(`[${new Date().toISOString()}] Launching stealth Chromium browser...`);
+/**
+ * Worker pool to process grid points concurrently
+ */
+async function processGridConcurrently(grid, concurrency = 20) {
+  const uniqueStations = new Map();
+  let completed = 0;
+  let cursor = 0;
 
-  let browser;
-  let allExtracted = [];
-
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1920,1080'
-      ]
-    });
-
-    const context = await browser.newContext({
-      userAgent: USER_AGENT,
-      viewport: { width: 1920, height: 1080 },
-      locale: 'el-GR',
-      timezoneId: 'Europe/Athens',
-      geolocation: { latitude: 37.9838, longitude: 23.7275 },
-      permissions: ['geolocation'],
-      deviceScaleFactor: 1
-    });
-
-    const page = await context.newPage();
-
-    // Anti-Bot Masking
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      window.chrome = { runtime: {}, loadTimes: function () {}, csi: function () {}, app: {} };
-      Object.defineProperty(navigator, 'languages', { get: () => ['el-GR', 'el', 'en-US', 'en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      const getParameterProto = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (param) {
-        if (param === 37445) return 'Google Inc. (NVIDIA)';
-        if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        return getParameterProto.apply(this, [param]);
-      };
-    });
-
-    const rawPayloads = [];
-
-    page.on('response', async (res) => {
-      const url = res.url();
-      const ct = res.headers()['content-type'] || '';
-      if (
-        (url.includes('GetStations') || url.includes('GetPrices') || url.includes('CheckPrices') || url.includes('map') || ct.includes('json')) &&
-        res.status() === 200
-      ) {
-        try {
-          const text = await res.text();
-          if (text.startsWith('{') || text.startsWith('[')) {
-            console.log(`[+] Intercepted candidate JSON payload from: ${url}`);
-            rawPayloads.push({ url, json: JSON.parse(text) });
+  async function worker() {
+    while (cursor < grid.length) {
+      const idx = cursor++;
+      const point = grid[idx];
+      try {
+        const xml = await fetchCoordinates(point.lat, point.lng);
+        const list = parseXmlStations(xml);
+        for (const s of list) {
+          if (!uniqueStations.has(s.id)) {
+            uniqueStations.set(s.id, s);
           }
-        } catch {}
-      }
-    });
-
-    console.log(`Navigating to ${TARGET_URL}...`);
-    const resp = await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e) => {
-      console.warn('Navigation error:', e.message);
-      return null;
-    });
-
-    if (resp && resp.status() === 500) {
-      console.warn('[!] Government Tomcat portal returned HTTP 500 (internal server malfunction).');
-    }
-
-    await page.waitForTimeout(3000);
-
-    // If form controls are visible, trigger search
-    const searchButton = page.locator('input[type="submit"], button[type="submit"], button:has-text("Αναζήτηση")').first();
-    if (await searchButton.isVisible().catch(() => false)) {
-      await searchButton.click().catch(() => {});
-      await page.waitForTimeout(4000);
-    }
-
-    for (const p of rawPayloads) {
-      const list = findStationList(p.json);
-      if (list.length > 0) {
-        allExtracted = allExtracted.concat(list.map(normalizeStation).filter(Boolean));
-      }
-    }
-  } catch (err) {
-    console.warn('Playwright run encountered an error:', err.message);
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-
-  // Fallback: If ministry portal returned 500 and 0 stations were intercepted
-  if (allExtracted.length === 0) {
-    console.warn('[!] 0 stations intercepted from ministry portal. Activating regional fallback feed...');
-    const fallbackStations = await fetchMirrorFallback();
-    allExtracted = allExtracted.concat(fallbackStations);
-  }
-
-  // Deduplicate
-  const uniqueMap = new Map();
-  for (const s of allExtracted) {
-    if (s && s.latitude && s.longitude) {
-      const key = `${s.id}_${s.latitude}_${s.longitude}`;
-      if (!uniqueMap.has(key)) {
-        uniqueMap.set(key, s);
+        }
+      } catch {}
+      completed++;
+      if (completed % 100 === 0 || completed === grid.length) {
+        process.stdout.write(
+          `\r[Scan Progress] ${completed}/${grid.length} points (${Math.round((completed / grid.length) * 100)}%) -> ${uniqueStations.size} unique stations`
+        );
       }
     }
   }
 
-  const finalStations = Array.from(uniqueMap.values());
-  console.log(`Total valid, deduplicated stations available: ${finalStations.length}`);
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.all(workers);
+  console.log('\nScan completed.');
+
+  return Array.from(uniqueStations.values());
+}
+
+async function main() {
+  console.log(`[${new Date().toISOString()}] Starting Greek Nationwide Gas Stations Scraper...`);
+
+  const grid = generateScanGrid();
+  console.log(`Generated geospatial scan grid: ${grid.length} coordinates across Greece.`);
+
+  const stations = await processGridConcurrently(grid, 25);
+  console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
+
+  if (stations.length < 1000) {
+    console.error(`[!] Error: Expected 4000+ stations, but only found ${stations.length}. Check network.`);
+    process.exit(1);
+  }
 
   const dir = path.dirname(OUTPUT_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  if (finalStations.length > 0) {
-    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(finalStations), 'utf-8');
-    console.log(`[✓] Saved ${finalStations.length} stations (${fs.statSync(OUTPUT_FILE).size} bytes) -> ${OUTPUT_FILE}`);
-  } else if (fs.existsSync(OUTPUT_FILE)) {
-    console.warn('[!] No stations retrieved and previous file exists. Preserving previous cache.');
-  }
+  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(stations), 'utf-8');
+  const sizeKb = Math.round(fs.statSync(OUTPUT_FILE).size / 1024);
+  console.log(`[OK] Saved ${stations.length} stations (${sizeKb} KB) -> ${OUTPUT_FILE}`);
 }
 
-scrape()
-  .then(() => {
-    console.log('Scraper finished successfully.');
-    process.exit(0);
-  })
-  .catch((err) => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-  });
+main().catch((err) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

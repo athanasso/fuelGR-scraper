@@ -6,10 +6,5 @@
   "scripts": {
     "start": "node scraper.js",
     "scrape": "node scraper.js"
-  },
-  "dependencies": {
-    "playwright": "^1.47.0",
-    "playwright-extra": "^4.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
