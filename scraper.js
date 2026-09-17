@@ -33,10 +33,10 @@ const API_PARAMS =
 function generateScanGrid() {
   const points = new Map();
 
-  const addPoint = (lat, lng) => {
-    const key = `${lat.toFixed(3)}_${lng.toFixed(3)}`;
+  const addPoint = (lat, lng, fuelType = 1) => {
+    const key = `${lat.toFixed(3)}_${lng.toFixed(3)}_${fuelType}`;
     if (!points.has(key)) {
-      points.set(key, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)) });
+      points.set(key, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)), fuelType });
     }
   };
 
@@ -108,15 +108,40 @@ function generateScanGrid() {
     }
   }
 
+  // 3. Regional capitals and secondary cities to guarantee 100% geographic coverage
+  const REGIONAL_CENTERS = [
+    [37.9838, 23.7275], [40.6401, 22.9444], [38.2466, 21.7346], [35.3387, 25.1442],
+    [39.6390, 22.4191], [39.3622, 22.9422], [39.6650, 20.8537], [37.0389, 22.1142],
+    [35.5138, 24.0180], [39.5557, 21.7679], [38.6253, 21.4093], [38.4633, 23.5976],
+    [41.0849, 23.5476], [40.9396, 24.4129], [39.3649, 21.9214], [36.4349, 28.2175],
+    [40.2709, 22.5061], [38.9000, 22.4333], [40.5244, 22.2033], [40.3006, 21.7889],
+    [40.4077, 21.6789], [37.9405, 22.9322], [40.8457, 25.8740], [41.1350, 24.8878],
+    [41.1192, 25.4054], [41.1500, 24.1500], [37.5683, 22.8067], [37.6333, 22.7333],
+    [37.6744, 21.4397], [37.5089, 22.3794], [39.6243, 19.9217], [35.3644, 24.4719],
+    [37.0733, 22.4297], [38.2617, 22.0850], [39.1100, 26.5547], [38.3678, 26.1358],
+    [37.7878, 20.8978], [38.1750, 20.4889], [38.8333, 20.7000], [35.1914, 25.7153],
+    [35.0117, 25.7422], [39.5000, 20.2667], [38.9500, 20.7500], [39.1600, 20.9850],
+    [40.7820, 21.4098], [40.5217, 21.2633], [40.0847, 21.4278], [40.9933, 22.8744],
+    [40.8017, 22.0478], [40.7936, 22.4339], [38.4333, 22.8750], [38.3197, 23.3178],
+    [38.3742, 21.4300], [38.5300, 22.3800], [38.9167, 21.7833], [37.7500, 26.9833],
+    [36.8933, 27.2889], [37.4417, 24.9417], [36.3932, 25.4615], [37.4467, 25.3289],
+    [37.1036, 25.3764], [37.0850, 25.1489], [39.9167, 25.2500], [35.8500, 27.1333]
+  ];
+
+  for (const [cLat, cLng] of REGIONAL_CENTERS) {
+    addPoint(cLat, cLng, 1);
+    addPoint(cLat, cLng, 6); // Also scan Autogas/LPG to uncap dual-fuel / LPG-exclusive stations
+  }
+
   return Array.from(points.values());
 }
 
 /**
  * Fetch raw XML feed from a single coordinate point
  */
-function fetchCoordinates(lat, lng) {
+function fetchCoordinates(lat, lng, fuelType = 1) {
   return new Promise((resolve) => {
-    const url = `${API_BASE}?${API_PARAMS}&lat=${lat}&long=${lng}`;
+    const url = `${API_BASE}?dev=android.4.0-b2da2cf97330ca3b&lat=${lat}&long=${lng}&f=${fuelType}&b=0&d=30&p=0&dSig=google/coral/coral:14/UQ1A.240205.004/1709778835:userdebug/release-keys&iLoc=unknown&apkSig=UPJ2YQunu9eGXu8a/WOiVNAZlYA=`;
     const req = https.get(
       url,
       {
@@ -234,7 +259,7 @@ async function processGridConcurrently(grid, concurrency = 20) {
       const idx = cursor++;
       const point = grid[idx];
       try {
-        const xml = await fetchCoordinates(point.lat, point.lng);
+        const xml = await fetchCoordinates(point.lat, point.lng, point.fuelType);
         const list = parseXmlStations(xml);
         for (const s of list) {
           if (!uniqueStations.has(s.id)) {
