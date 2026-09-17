@@ -6,6 +6,5 @@ __pycache__/
 venv/
 public/
 dist/
+data/
 .playwright/
-data/prefectures_*.json
-!data/prefectures_latest.json
