@@ -37,12 +37,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          npm install
+          npx playwright install --with-deps chromium
 
       - name: Run prefecture fuel prices scraper
         run: python scraper.py
 
       - name: Run station-level fuel prices scraper
         run: node scraper.js
+
+      - name: Run Google Reviews enrichment scraper
+        continue-on-error: true
+        run: node reviews_scraper.js --concurrency 2 --limit 50 --input data/stations_latest.min.json
 
       - name: Package dataset and compress with zstd
         run: python package_dataset.py
@@ -63,6 +69,8 @@ jobs:
             "dist/prefectures_latest.min.json"
             "dist/prefectures_latest.min.json.zst"
             "dist/prefectures_latest.json"
+            "dist/reviews.min.json"
+            "dist/reviews.min.json.zst"
           )
 
           # Keep the date tag pointed at this workflow run's commit so

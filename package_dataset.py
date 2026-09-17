@@ -229,7 +229,7 @@ def sparkline_and_delta(records: list[dict], fuel_key: str, today_price: float):
     return sp, d7
 
 
-def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]]):
+def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]], reviews: dict[str, dict] | None = None):
     st_id = str(raw.get("id", "")).strip()
     name = str(raw.get("name", "")).strip()
     brand = str(raw.get("brand", "")).strip() or "Ανεξάρτητο"
@@ -277,6 +277,13 @@ def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]
         "sp": sparklines,
         "dt": last_updated if isinstance(last_updated, str) else today,
     }
+    if reviews and st_id in reviews:
+        rev = reviews[st_id]
+        if isinstance(rev, dict):
+            if rev.get("rating") is not None:
+                master_item["mr"] = round(float(rev["rating"]), 1)
+            if rev.get("reviews") is not None:
+                master_item["mc"] = int(rev["reviews"])
 
     detailed_history = {
         "id": st_id,
@@ -352,8 +359,29 @@ def main():
         print(f"Transforming {len(raw_stations)} stations with real price history...")
         ledger = load_previous_ledger(data_dir)
 
+        # Load Google Reviews
+        reviews_data = {}
+        rev_file = data_dir / "reviews.min.json"
+        if rev_file.exists():
+            try:
+                with open(rev_file, "r", encoding="utf-8") as f_rev:
+                    reviews_data = json.load(f_rev)
+                print(f"  [OK] Loaded local reviews ({len(reviews_data)} stations).")
+            except Exception as e:
+                print(f"  [!] Local reviews unreadable: {e}")
+        if not reviews_data:
+            remote_rev = fetch_json("https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json")
+            if isinstance(remote_rev, dict):
+                reviews_data = remote_rev
+                print(f"  [OK] Loaded CDN reviews ({len(reviews_data)} stations).")
+
+        if reviews_data:
+            with open(dist_dir / "reviews.min.json", "w", encoding="utf-8") as f_rev_dist:
+                json.dump(reviews_data, f_rev_dist, ensure_ascii=False, separators=(",", ":"))
+            compress_zstd(dist_dir / "reviews.min.json", dist_dir / "reviews.min.json.zst")
+
         for raw in raw_stations:
-            master_item, detail_history = build_master_and_history(raw, today, ledger)
+            master_item, detail_history = build_master_and_history(raw, today, ledger, reviews_data)
             master_stations.append(master_item)
 
             hist_file = history_dir / f"{master_item['id']}.json"

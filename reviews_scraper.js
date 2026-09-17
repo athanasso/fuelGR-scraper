@@ -29,7 +29,8 @@ const getArg = (flag, def) => {
   const i = args.indexOf(flag);
   return i !== -1 && args[i + 1] ? args[i + 1] : def;
 };
-const LIMIT       = parseInt(getArg('--limit', '0'), 10);       // 0 = all
+const isCI        = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
+const LIMIT       = parseInt(getArg('--limit', isCI ? '50' : '0'), 10);
 const CONCURRENCY = parseInt(getArg('--concurrency', '3'), 10);
 const INPUT_FILE  = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
 const OUTPUT_FILE = path.join(__dirname, 'data', 'reviews.min.json');
@@ -38,12 +39,29 @@ const OUTPUT_FILE = path.join(__dirname, 'data', 'reviews.min.json');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => sleep(min + Math.random() * (max - min));
 
-function loadExisting() {
+async function loadExisting() {
+  // 1. Local file if already exists
+  if (fs.existsSync(OUTPUT_FILE)) {
+    try {
+      const local = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
+      if (local && Object.keys(local).length > 0) return local;
+    } catch {}
+  }
+  // 2. Fetch remote CDN asset from latest release (incremental bootstrap in CI)
   try {
-    if (fs.existsSync(OUTPUT_FILE)) {
-      return JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
+    const res = await fetch('https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json', {
+      headers: { 'User-Agent': 'fuelGR-scraper/1.0' }
+    });
+    if (res.ok) {
+      const remote = await res.json();
+      if (remote && typeof remote === 'object') {
+        console.log(`[OK] Bootstrapped ${Object.keys(remote).length} existing reviews from latest release CDN.`);
+        return remote;
+      }
     }
-  } catch {}
+  } catch (err) {
+    console.log(`[i] Starting fresh reviews dataset (${err.message}).`);
+  }
   return {};
 }
 
@@ -64,6 +82,12 @@ async function fetchGoogleReviews(page, stationName, address) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await page.waitForTimeout(2000);
+
+    // Check if Google blocked this IP with a CAPTCHA / unusual traffic page
+    if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
+      console.warn('\n[!] Google rate-limit or CAPTCHA detected on current runner IP.');
+      return { rating: null, reviews: null, blocked: true };
+    }
 
     // Bypass Google Consent screen if present
     try {
@@ -170,7 +194,11 @@ async function workerLoop(browser, queue, results, done) {
     process.stdout.write(`[${done.count + 1}] ${name} (${id})... `);
 
     const result = await fetchGoogleReviews(page, name, address || '');
-    results[id] = { ...result, ts: Math.floor(Date.now() / 1000) };
+    if (result.blocked) {
+      queue.length = 0; // stop remaining requests gracefully
+      break;
+    }
+    results[id] = { rating: result.rating, reviews: result.reviews, ts: Math.floor(Date.now() / 1000) };
     done.count++;
 
     const tag = result.rating ? `★${result.rating} (${result.reviews})` : 'n/a';
@@ -196,7 +224,7 @@ async function main() {
   console.log(`Loaded ${stations.length} stations.`);
 
   // Load existing reviews (incremental)
-  const results = loadExisting();
+  const results = await loadExisting();
   const alreadyDone = Object.keys(results).length;
   console.log(`${alreadyDone} stations already reviewed — skipping.`);
 
