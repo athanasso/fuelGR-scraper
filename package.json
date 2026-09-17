@@ -6,5 +6,8 @@
   "scripts": {
     "start": "node scraper.js",
     "scrape": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
   }
 }
