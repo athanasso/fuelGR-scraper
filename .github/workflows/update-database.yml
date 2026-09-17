@@ -58,6 +58,8 @@ jobs:
             "dist/stations_latest.min.json"
             "dist/stations_latest.min.json.zst"
             "dist/stations_latest.json"
+            "dist/price_ledger.min.json"
+            "dist/price_ledger.min.json.zst"
             "dist/prefectures_latest.min.json"
             "dist/prefectures_latest.min.json.zst"
             "dist/prefectures_latest.json"
