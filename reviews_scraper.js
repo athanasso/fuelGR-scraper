@@ -34,9 +34,14 @@ const LIMIT        = parseInt(getArg('--limit', isCI ? '0' : '0'), 10);
 const CONCURRENCY  = parseInt(getArg('--concurrency', '1'), 10);
 const DELAY_MIN    = parseInt(getArg('--delay-min', '3000'), 10);
 const DELAY_MAX    = parseInt(getArg('--delay-max', '6000'), 10);
-const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10); // 150 min time budget
+const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10);
+const SHARD        = parseInt(getArg('--shard', '0'), 10);
+const TOTAL_SHARDS = parseInt(getArg('--total-shards', '1'), 10);
 const INPUT_FILE   = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
-const OUTPUT_FILE  = path.join(__dirname, 'data', 'reviews.min.json');
+const defaultOutput = TOTAL_SHARDS > 1
+  ? path.join(__dirname, 'data', `reviews_shard_${SHARD}.json`)
+  : path.join(__dirname, 'data', 'reviews.min.json');
+const OUTPUT_FILE  = getArg('--output', defaultOutput);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -246,6 +251,12 @@ async function main() {
   console.log(`${alreadyDone} stations already reviewed — skipping.`);
 
   let queue = stations.filter(s => !results[String(s.id)]);
+
+  // Shard work across parallel matrix runners
+  if (TOTAL_SHARDS > 1) {
+    queue = queue.filter((_, idx) => idx % TOTAL_SHARDS === SHARD);
+    console.log(`[Shard ${SHARD + 1}/${TOTAL_SHARDS}] Assigned ${queue.length} stations.`);
+  }
 
   // Prioritize major urban centers: Athens/Attica, Piraeus, Thessaloniki, Patras, Heraklion
   const PRIORITY_PREFS = [
