@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: 'Maximum stations to scrape in this run (0 for all remaining)'
+        description: 'Maximum stations to scrape in this run (0 for time-budgeted batch)'
         required: false
-        default: '100'
+        default: '0'
+      max_time_min:
+        description: 'Time budget in minutes before clean exit & packaging'
+        required: false
+        default: '150'
       concurrency:
         description: 'Browser contexts in parallel (keep at 1 for anti-bot safety)'
         required: false
@@ -17,11 +21,11 @@ on:
       delay_min:
         description: 'Minimum jitter delay per station in ms'
         required: false
-        default: '6000'
+        default: '3000'
       delay_max:
         description: 'Maximum jitter delay per station in ms'
         required: false
-        default: '12000'
+        default: '6000'
 
 permissions:
   contents: write
@@ -33,7 +37,7 @@ concurrency:
 jobs:
   scrape-reviews:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -67,22 +71,27 @@ jobs:
       - name: Run slow stealth reviews scraper
         continue-on-error: true
         run: |
-          LIMIT="${{ github.event.inputs.limit || '100' }}"
+          LIMIT="${{ github.event.inputs.limit || '0' }}"
+          MAX_TIME="${{ github.event.inputs.max_time_min || '150' }}"
           CONCURRENCY="${{ github.event.inputs.concurrency || '1' }}"
-          DELAY_MIN="${{ github.event.inputs.delay_min || '6000' }}"
-          DELAY_MAX="${{ github.event.inputs.delay_max || '12000' }}"
-          echo "Starting slow scraper with limit=${LIMIT}, concurrency=${CONCURRENCY}, delay=${DELAY_MIN}-${DELAY_MAX}ms..."
-          node reviews_scraper.js --limit "${LIMIT}" --concurrency "${CONCURRENCY}" --delay-min "${DELAY_MIN}" --delay-max "${DELAY_MAX}" --input data/stations_latest.min.json
+          DELAY_MIN="${{ github.event.inputs.delay_min || '3000' }}"
+          DELAY_MAX="${{ github.event.inputs.delay_max || '6000' }}"
+          echo "Starting slow scraper with limit=${LIMIT}, max_time=${MAX_TIME}m, concurrency=${CONCURRENCY}, delay=${DELAY_MIN}-${DELAY_MAX}ms..."
+          node reviews_scraper.js --limit "${LIMIT}" --max-time-min "${MAX_TIME}" --concurrency "${CONCURRENCY}" --delay-min "${DELAY_MIN}" --delay-max "${DELAY_MAX}" --input data/stations_latest.min.json
 
       - name: Package updated reviews dataset
-        run: python package_dataset.py
+        if: always()
+        run: |
+          if [ -f "data/reviews.min.json" ]; then
+            python package_dataset.py
+          fi
 
       - name: Update GitHub Release Assets with Fresh Reviews
+        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find latest release tag
           TAG=$(gh release view --json tagName -q .tagName)
           echo "Updating assets on release ${TAG}..."
           if [ -f "dist/reviews.min.json" ]; then

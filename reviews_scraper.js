@@ -9,10 +9,12 @@
  *  - Supports both raw schema (name, brand, address) and compact schema (n, b, a)
  *  - Dual-mode extraction: direct place detail (div.F7nice) + search results feed (div.Nv2PK)
  *  - Isolation: cleans page between queries to prevent SPA state bleed
- *  - Anti-bot safety: concurrency=1, human jitter delays, CAPTCHA detection
+ *  - Dynamic wait: uses selector-based waiting instead of heavy fixed timeouts
+ *  - Time budget: stops cleanly before GitHub Actions job timeouts (e.g. 150m)
+ *  - Anti-bot safety: human jitter delays, CAPTCHA detection, single browser context
  *
  * Usage:
- *   node reviews_scraper.js [--limit N] [--concurrency N] [--input path]
+ *   node reviews_scraper.js [--limit N] [--concurrency N] [--max-time-min N] [--delay-min N] [--delay-max N] [--input path]
  */
 
 'use strict';
@@ -27,13 +29,14 @@ const getArg = (flag, def) => {
   const i = args.indexOf(flag);
   return i !== -1 && args[i + 1] ? args[i + 1] : def;
 };
-const isCI        = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
-const LIMIT       = parseInt(getArg('--limit', isCI ? '50' : '0'), 10);
-const CONCURRENCY = parseInt(getArg('--concurrency', '1'), 10);
-const DELAY_MIN   = parseInt(getArg('--delay-min', '6000'), 10);
-const DELAY_MAX   = parseInt(getArg('--delay-max', '12000'), 10);
-const INPUT_FILE  = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
-const OUTPUT_FILE = path.join(__dirname, 'data', 'reviews.min.json');
+const isCI         = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
+const LIMIT        = parseInt(getArg('--limit', isCI ? '0' : '0'), 10);
+const CONCURRENCY  = parseInt(getArg('--concurrency', '1'), 10);
+const DELAY_MIN    = parseInt(getArg('--delay-min', '3000'), 10);
+const DELAY_MAX    = parseInt(getArg('--delay-max', '6000'), 10);
+const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10); // 150 min time budget
+const INPUT_FILE   = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
+const OUTPUT_FILE  = path.join(__dirname, 'data', 'reviews.min.json');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -88,9 +91,7 @@ async function fetchGoogleReviews(page, station) {
   try {
     // Reset state before navigation to prevent Single Page App DOM leaking from previous place
     await page.goto('about:blank');
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await page.waitForTimeout(2000);
-    try { await page.mouse.wheel(0, 150 + Math.random() * 200); } catch {}
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
     // Check if Google blocked this IP with a CAPTCHA
     if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
@@ -103,16 +104,19 @@ async function fetchGoogleReviews(page, station) {
       const consentBtn = await page.$('button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button');
       if (consentBtn) {
         await consentBtn.click();
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1000);
       }
     } catch {}
+
+    // Dynamic wait for place detail header or search result feed
+    await page.waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 3500 }).catch(() => {});
 
     // If search results list (div.Nv2PK) appeared, click the first place card
     if (!page.url().includes('/place/')) {
       const firstCard = await page.$('div.Nv2PK a.hfpxzc, div.Nv2PK [role="article"], [role="feed"] [role="article"]');
       if (firstCard) {
         await firstCard.click();
-        await page.waitForTimeout(2500);
+        await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2500 }).catch(() => {});
       }
     }
 
@@ -174,7 +178,7 @@ async function fetchGoogleReviews(page, station) {
 }
 
 // ── Worker ─────────────────────────────────────────────────────────────────────
-async function workerLoop(browser, queue, results, done) {
+async function workerLoop(browser, queue, results, done, startTime, maxDurationMs) {
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'el-GR',
@@ -185,6 +189,14 @@ async function workerLoop(browser, queue, results, done) {
 
   while (true) {
     if (queue.length === 0) break;
+
+    // Check time budget before starting next station
+    if (maxDurationMs > 0 && Date.now() - startTime >= maxDurationMs) {
+      console.log(`\n[i] Time budget reached. Gracefully wrapping up current batch...`);
+      queue.length = 0;
+      break;
+    }
+
     const station = queue.shift();
     const id = String(station.id);
     const brand = station.brand || station.b || '';
@@ -254,7 +266,11 @@ async function main() {
     queue = queue.slice(0, LIMIT);
   }
 
-  console.log(`Queuing ${queue.length} stations with concurrency=${CONCURRENCY}.`);
+  if (MAX_TIME_MIN > 0) {
+    console.log(`Time budget configured: ${MAX_TIME_MIN} minutes.`);
+  }
+
+  console.log(`Queuing ${queue.length} stations with concurrency=${CONCURRENCY}, delay=${DELAY_MIN}-${DELAY_MAX}ms.`);
   if (queue.length === 0) {
     console.log('All stations already enriched!');
     return;
@@ -262,6 +278,8 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true });
   const done = { count: 0 };
+  const startTime = Date.now();
+  const maxDurationMs = MAX_TIME_MIN > 0 ? MAX_TIME_MIN * 60 * 1000 : 0;
 
   // Handle Ctrl+C / SIGINT cleanly
   let exiting = false;
@@ -277,14 +295,15 @@ async function main() {
   process.on('SIGTERM', onExit);
 
   const workers = Array.from({ length: CONCURRENCY }, () =>
-    workerLoop(browser, queue, results, done)
+    workerLoop(browser, queue, results, done, startTime, maxDurationMs)
   );
 
   await Promise.all(workers);
   await browser.close();
 
   saveReviews(results);
-  console.log(`\n[DONE] Enriched ${done.count} stations. Total reviews stored: ${Object.keys(results).length}.`);
+  const elapsedMin = ((Date.now() - startTime) / 60000).toFixed(1);
+  console.log(`\n[DONE] Enriched ${done.count} stations in ${elapsedMin} min. Total reviews stored: ${Object.keys(results).length}.`);
 }
 
 main().catch(err => {
