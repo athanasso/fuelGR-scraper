@@ -252,10 +252,11 @@ async function main() {
 
   let queue = stations.filter(s => !results[String(s.id)]);
 
-  // Shard work across parallel matrix runners
+  // Shard work across parallel matrix runners (supports 1-indexed 1..N or 0-indexed 0..N-1)
   if (TOTAL_SHARDS > 1) {
-    queue = queue.filter((_, idx) => idx % TOTAL_SHARDS === SHARD);
-    console.log(`[Shard ${SHARD + 1}/${TOTAL_SHARDS}] Assigned ${queue.length} stations.`);
+    const targetMod = (SHARD >= 1 && SHARD <= TOTAL_SHARDS) ? SHARD - 1 : SHARD;
+    queue = queue.filter((_, idx) => idx % TOTAL_SHARDS === targetMod);
+    console.log(`[Shard ${SHARD}/${TOTAL_SHARDS}] Assigned ${queue.length} stations.`);
   }
 
   // Prioritize major urban centers: Athens/Attica, Piraeus, Thessaloniki, Patras, Heraklion
