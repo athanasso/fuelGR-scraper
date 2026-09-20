@@ -65,8 +65,12 @@ async function main() {
         const shardData = JSON.parse(fs.readFileSync(file, 'utf8'));
         const keys = Object.keys(shardData);
         for (const k of keys) {
-          if (!merged[k] || (shardData[k].ts && (!merged[k].ts || shardData[k].ts > merged[k].ts))) {
-            merged[k] = shardData[k];
+          const incoming = shardData[k];
+          if (!incoming || typeof incoming.rating !== 'number' || !(Number(incoming.reviews) > 0)) {
+            continue; // never merge star-with-zero-reviews
+          }
+          if (!merged[k] || (incoming.ts && (!merged[k].ts || incoming.ts > merged[k].ts))) {
+            merged[k] = incoming;
             newEntries++;
           }
         }
@@ -76,6 +80,16 @@ async function main() {
       }
     }
   }
+
+  // Drop any lingering zero-review / invalid rows from baseline
+  let purged = 0;
+  for (const [k, v] of Object.entries(merged)) {
+    if (!v || typeof v.rating !== 'number' || !(Number(v.reviews) > 0)) {
+      delete merged[k];
+      purged++;
+    }
+  }
+  if (purged > 0) console.log(`Purged ${purged} invalid review entries from merge.`);
 
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(merged), 'utf8');

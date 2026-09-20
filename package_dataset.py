@@ -280,10 +280,12 @@ def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]
     if reviews and st_id in reviews:
         rev = reviews[st_id]
         if isinstance(rev, dict):
-            if rev.get("rating") is not None:
-                master_item["mr"] = round(float(rev["rating"]), 1)
-            if rev.get("reviews") is not None:
-                master_item["mc"] = int(rev["reviews"])
+            rating = rev.get("rating")
+            count = rev.get("reviews")
+            # Skip bogus star-with-zero-reviews matches
+            if rating is not None and count is not None and int(count) > 0:
+                master_item["mr"] = round(float(rating), 1)
+                master_item["mc"] = int(count)
 
     detailed_history = {
         "id": st_id,
