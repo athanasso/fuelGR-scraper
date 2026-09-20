@@ -123,9 +123,19 @@ function extractRatingFromPage() {
   let rating = null;
   let reviews = null;
   let title = '';
+  let subtitle = '';
 
   const heading = document.querySelector('div[role="main"] h1, h1.DUwDvf, h1');
   if (heading) title = (heading.textContent || '').trim();
+
+  const addrEl = document.querySelector(
+    'button[data-item-id="address"], div[data-item-id="address"], [data-item-id^="address"]'
+  );
+  if (addrEl) subtitle = (addrEl.textContent || '').trim();
+  if (!subtitle) {
+    const io = document.querySelector('div.Io6YTe');
+    if (io) subtitle = (io.textContent || '').trim();
+  }
 
   const f7 = document.querySelector('div.F7nice');
   if (f7) {
@@ -171,7 +181,7 @@ function extractRatingFromPage() {
     }
   }
 
-  return { rating, reviews, title };
+  return { rating, reviews, title, subtitle };
 }
 
 function tokens(s) {
@@ -183,22 +193,34 @@ function tokens(s) {
     .filter((t) => t.length > 2);
 }
 
-function titleMatchesStation(title, station) {
+function titleMatchesStation(title, station, subtitle = '') {
   const name = station.name || station.n || '';
   const address = station.address || station.a || '';
+  const brandRaw = station.brand || station.b || '';
+  const { primary: brand } = normalizeBrand(brandRaw);
+
   const nameToks = tokens(name);
   const addrToks = tokens(address);
-  const have = new Set(tokens(title));
-  if (nameToks.length === 0 && addrToks.length === 0) return true;
+  const brandToks = tokens(brand);
+  const have = new Set(tokens(`${title} ${subtitle}`));
+  if (nameToks.length === 0 && addrToks.length === 0 && brandToks.length === 0) return true;
 
-  // Must hit at least one distinctive name token (not just a shared street word)
   const nameHits = nameToks.filter((t) => have.has(t)).length;
-  if (nameToks.length > 0 && nameHits === 0) return false;
+  const addrHits = addrToks.filter((t) => have.has(t)).length;
+  const brandHits = brandToks.filter((t) => have.has(t)).length;
 
-  const want = [...nameToks, ...addrToks];
+  // Owner trade name (ARGYOIL EE)
+  if (nameHits >= 1 && nameToks.length <= 2) return true;
+  if (nameHits >= 2) return true;
+
+  // Maps often titles the pin as brand only ("Aegean"); street lives in the address row
+  if (brandHits >= 1 && addrHits >= 1) return true;
+  if (brandHits >= 1 && nameHits >= 1) return true;
+
+  const want = [...nameToks, ...addrToks, ...brandToks];
   let hits = 0;
   for (const t of want) if (have.has(t)) hits++;
-  return hits / want.length >= 0.25 || nameHits >= 2 || (nameHits >= 1 && nameToks.length <= 2);
+  return hits / Math.max(want.length, 1) >= 0.25;
 }
 
 /**
@@ -222,18 +244,21 @@ async function fetchGoogleReviews(page, station) {
 
   // Prefer unique business identity over generic brand (avoids wrong nearby AEGEAN/SHELL)
   if (name && address) pushQ([name, address]);
+  if (name && mun) pushQ([name, mun]);
   if (name) pushQ([name]);
   if (!isNaN(lat) && !isNaN(lng) && name) {
     pushQ([name, address || mun, `${lat},${lng}`]);
   }
+  // Brand + street — Maps often titles the pin as "Aegean" not "ARGYOIL EE"
   if (brand && address) pushQ([brand, address, mun]);
+  if (brand && address) pushQ([brand, address]);
   for (const b of brandAlts.slice(0, 2)) {
-    if (address) pushQ([b, address]);
+    if (address) pushQ([b, address, mun || '']);
   }
   pushQ([name, address, mun, 'Greece']);
 
   try {
-    for (let qi = 0; qi < Math.min(queries.length, 3); qi++) {
+    for (let qi = 0; qi < Math.min(queries.length, 5); qi++) {
       const url = `https://www.google.com/maps/search/${encodeURIComponent(queries[qi])}`;
 
       await page.goto('about:blank');
@@ -260,7 +285,7 @@ async function fetchGoogleReviews(page, station) {
 
       if (!page.url().includes('/place/')) {
         // Prefer a result card whose title overlaps the station name — never blind-click #1
-        const targetName = name;
+        const targetName = [name, brand].filter(Boolean).join(' ');
         const clicked = await page.evaluate((wantName) => {
           const cards = Array.from(
             document.querySelectorAll('div.Nv2PK a.hfpxzc, [role="feed"] a.hfpxzc')
@@ -309,7 +334,7 @@ async function fetchGoogleReviews(page, station) {
         result.rating !== null &&
         result.reviews !== null &&
         result.reviews > 0 &&
-        titleMatchesStation(result.title || '', station)
+        titleMatchesStation(result.title || '', station, result.subtitle || '')
       ) {
         return result;
       }
