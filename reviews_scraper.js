@@ -157,12 +157,19 @@ function tokens(s) {
 function titleMatchesStation(title, station) {
   const name = station.name || station.n || '';
   const address = station.address || station.a || '';
-  const want = tokens(`${name} ${address}`);
-  if (want.length === 0) return true;
+  const nameToks = tokens(name);
+  const addrToks = tokens(address);
   const have = new Set(tokens(title));
+  if (nameToks.length === 0 && addrToks.length === 0) return true;
+
+  // Must hit at least one distinctive name token (not just a shared street word)
+  const nameHits = nameToks.filter((t) => have.has(t)).length;
+  if (nameToks.length > 0 && nameHits === 0) return false;
+
+  const want = [...nameToks, ...addrToks];
   let hits = 0;
   for (const t of want) if (have.has(t)) hits++;
-  return hits / want.length >= 0.2 || hits >= 1;
+  return hits / want.length >= 0.25 || nameHits >= 2 || (nameHits >= 1 && nameToks.length <= 2);
 }
 
 /**
@@ -223,11 +230,46 @@ async function fetchGoogleReviews(page, station) {
         .catch(() => {});
 
       if (!page.url().includes('/place/')) {
-        const firstCard = await page.$(
-          'div.Nv2PK a.hfpxzc, div.Nv2PK [role="article"], [role="feed"] [role="article"]'
-        );
-        if (firstCard) {
-          await firstCard.click();
+        // Prefer a result card whose title overlaps the station name — never blind-click #1
+        const targetName = name;
+        const clicked = await page.evaluate((wantName) => {
+          const cards = Array.from(
+            document.querySelectorAll('div.Nv2PK a.hfpxzc, [role="feed"] a.hfpxzc')
+          );
+          const norm = (s) =>
+            String(s || '')
+              .toLowerCase()
+              .normalize('NFD')
+              .replace(/[\u0300-\u036f]/g, '');
+          const want = norm(wantName)
+            .split(/[^a-z0-9\u0370-\u03ff]+/i)
+            .filter((t) => t.length > 2);
+          const score = (label) => {
+            const have = new Set(
+              norm(label)
+                .split(/[^a-z0-9\u0370-\u03ff]+/i)
+                .filter((t) => t.length > 2)
+            );
+            return want.filter((t) => have.has(t)).length;
+          };
+          let best = null;
+          let bestScore = 0;
+          for (const a of cards) {
+            const label = a.getAttribute('aria-label') || a.textContent || '';
+            const s = score(label);
+            if (s > bestScore) {
+              bestScore = s;
+              best = a;
+            }
+          }
+          if (best && bestScore > 0) {
+            best.click();
+            return true;
+          }
+          return false;
+        }, targetName);
+
+        if (clicked) {
           await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2500 }).catch(() => {});
         }
       }
