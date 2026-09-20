@@ -18,8 +18,8 @@ const OUTPUT_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
 
 const AGENT = new https.Agent({
   keepAlive: true,
-  maxSockets: 20,
-  timeout: 15000
+  maxSockets: 8,
+  timeout: 20000
 });
 
 const API_HOST = 'fuelgr.gr';
@@ -43,8 +43,13 @@ const MAX_PRICE = 5.0;
  */
 const SCAN_FUEL_TYPES = [1, 2, 4, 5, 6];
 
-function uuid() {
-  return crypto.randomUUID();
+/** One stable web device id per scraper run (browser reuses localStorage deviceId). */
+const SESSION_DEVICE_ID = 'web.' + crypto.randomUUID();
+
+const FETCH_STATS = { ok: 0, empty: 0, badDecode: 0, retried: 0 };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -66,27 +71,50 @@ function buildLocalStoragePayload(lat, lng, fuelType) {
     logged_in: 'false',
     d_lat: String(lat),
     d_lng: String(lng),
-    deviceId: 'web.' + uuid(),
+    deviceId: SESSION_DEVICE_ID,
     mobile_user: 'false',
     sort: '0'
   });
 }
 
+function looksLikeStationXml(xml) {
+  return typeof xml === 'string' && (xml.includes('<gss') || xml.includes('<?xml') || xml.includes('<gs '));
+}
+
 /**
- * Web API returns body as base64 with thirds rotated:
- *   [part1][part2][part3] -> decode(part3 + part2 + part1)
- * Matches browser: decodeURIComponent(escape(atob(reassembled)))
+ * Wire body is base64(XML) with thirds rotated (C+B+A).
+ * Server uses PHP-style str_split(ceil(n/3)) — remainder lands on the last
+ * original part(s). Browser JS uses floor(n/3) which only matches when
+ * n % 3 !== 2. Try both and keep the decode that yields station XML.
  */
+function unscrambleFloor(raw) {
+  const n = raw.length;
+  const f = Math.floor(n / 3);
+  const reassembled = raw.slice(n - f) + raw.slice(n - 2 * f, n - f) + raw.slice(0, n - 2 * f);
+  return Buffer.from(reassembled, 'base64').toString('utf8');
+}
+
+function unscrambleCeil(raw) {
+  const n = raw.length;
+  const chunk = Math.ceil(n / 3);
+  const cLen = n - 2 * chunk;
+  if (cLen < 1) return '';
+  const C = raw.slice(0, cLen);
+  const B = raw.slice(cLen, cLen + chunk);
+  const A = raw.slice(cLen + chunk);
+  return Buffer.from(A + B + C, 'base64').toString('utf8');
+}
+
 function unscrambleResponse(raw) {
   if (!raw || raw.length < 4) return '';
-  const len = raw.length;
-  const third = Math.floor(len / 3);
-  const part1 = raw.substring(0, len - third * 2);
-  const part2 = raw.substring(len - third * 2, len - third);
-  const part3 = raw.substring(len - third);
-  const reassembled = part3 + part2 + part1;
   try {
-    return Buffer.from(reassembled, 'base64').toString('utf8');
+    const mod = raw.length % 3;
+    // Prefer the split that matches this length class, then fall back.
+    const primary = mod === 2 ? unscrambleCeil(raw) : unscrambleFloor(raw);
+    if (looksLikeStationXml(primary)) return primary;
+    const secondary = mod === 2 ? unscrambleFloor(raw) : unscrambleCeil(raw);
+    if (looksLikeStationXml(secondary)) return secondary;
+    return '';
   } catch {
     return '';
   }
@@ -204,11 +232,18 @@ function generateScanGrid() {
 }
 
 /**
- * POST to web API with mocked localStorage payload.
+ * POST to web API with mocked localStorage payload (multipart FormData like the browser).
  */
-function fetchCoordinates(lat, lng, fuelType = 1) {
+function fetchRaw(lat, lng, fuelType = 1) {
   return new Promise((resolve) => {
-    const body = 'ls=' + encodeURIComponent(buildLocalStoragePayload(lat, lng, fuelType));
+    const ls = buildLocalStoragePayload(lat, lng, fuelType);
+    const boundary = '----WebKitFormBoundary' + crypto.randomBytes(8).toString('hex');
+    const body =
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="ls"\r\n\r\n` +
+      `${ls}\r\n` +
+      `--${boundary}--\r\n`;
+
     const req = https.request(
       {
         hostname: API_HOST,
@@ -216,34 +251,79 @@ function fetchCoordinates(lat, lng, fuelType = 1) {
         method: 'POST',
         agent: AGENT,
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
           'Content-Length': Buffer.byteLength(body),
           'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           Accept: '*/*',
+          'Accept-Language': 'el-GR,el;q=0.9,en-US;q=0.8,en;q=0.7',
           Origin: 'https://fuelgr.gr',
           Referer: 'https://fuelgr.gr/web/'
         },
-        timeout: 12000
+        timeout: 15000
       },
       (res) => {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          resolve(unscrambleResponse(raw));
+          resolve({
+            status: res.statusCode || 0,
+            raw: Buffer.concat(chunks).toString('utf8')
+          });
         });
-        res.on('error', () => resolve(''));
+        res.on('error', () => resolve({ status: 0, raw: '' }));
       }
     );
-    req.on('error', () => resolve(''));
+    req.on('error', () => resolve({ status: 0, raw: '' }));
     req.on('timeout', () => {
       req.destroy();
-      resolve('');
+      resolve({ status: 0, raw: '' });
     });
     req.write(body);
     req.end();
   });
+}
+
+async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) {
+      FETCH_STATS.retried++;
+      await sleep(400 * i + Math.floor(Math.random() * 200));
+    }
+    const { status, raw } = await fetchRaw(lat, lng, fuelType);
+    if (!raw || raw.length < 4) {
+      FETCH_STATS.empty++;
+      continue;
+    }
+    const xml = unscrambleResponse(raw);
+    if (looksLikeStationXml(xml)) {
+      FETCH_STATS.ok++;
+      return xml;
+    }
+    FETCH_STATS.badDecode++;
+    if (i === attempts - 1 && FETCH_STATS.badDecode <= 3) {
+      console.warn(
+        `\n[warn] bad decode status=${status} rawLen=${raw.length} mod3=${raw.length % 3} head=${raw.slice(0, 48)}`
+      );
+    }
+  }
+  return '';
+}
+
+/** Fail fast if the API is blocked / returning unusable bodies. */
+async function preflightProbe() {
+  console.log('Preflight probe (Athens Unleaded 95)...');
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const xml = await fetchCoordinates(37.9838, 23.7275, 1, 2);
+    const n = parseXmlStations(xml).length;
+    if (n > 0) {
+      console.log(`Preflight OK: ${n} stations near Athens.`);
+      return true;
+    }
+    console.warn(`Preflight attempt ${attempt}/5 failed; backing off...`);
+    await sleep(2000 * attempt);
+  }
+  return false;
 }
 
 /**
@@ -351,7 +431,6 @@ function mergeStation(existing, incoming) {
   if (incoming.last_updated && incoming.last_updated > (merged.last_updated || '')) {
     merged.last_updated = incoming.last_updated;
   }
-  // Prefer non-empty address / brand from whichever has them
   if (!merged.address && incoming.address) merged.address = incoming.address;
   if (incoming.brand && incoming.brand !== 'Ανεξάρτητο') merged.brand = incoming.brand;
   if (incoming.name && incoming.name !== 'Πρατήριο Καυσίμων') merged.name = incoming.name;
@@ -359,9 +438,9 @@ function mergeStation(existing, incoming) {
 }
 
 /**
- * Worker pool to process grid points concurrently.
+ * Worker pool to process grid points concurrently (kept modest to avoid CF throttling).
  */
-async function processGridConcurrently(grid, concurrency = 12) {
+async function processGridConcurrently(grid, concurrency = 6) {
   const uniqueStations = new Map();
   let completed = 0;
   let cursor = 0;
@@ -383,6 +462,8 @@ async function processGridConcurrently(grid, concurrency = 12) {
       } catch {
         // skip failed point
       }
+      // Gentle pacing — datacenter IPs get throttled under burst load
+      await sleep(40 + Math.floor(Math.random() * 40));
       completed++;
       if (completed % 50 === 0 || completed === grid.length) {
         process.stdout.write(
@@ -397,6 +478,9 @@ async function processGridConcurrently(grid, concurrency = 12) {
   const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.all(workers);
   console.log('\nScan completed.');
+  console.log(
+    `Fetch stats: ok=${FETCH_STATS.ok} empty=${FETCH_STATS.empty} badDecode=${FETCH_STATS.badDecode} retried=${FETCH_STATS.retried}`
+  );
 
   return Array.from(uniqueStations.values());
 }
@@ -404,14 +488,22 @@ async function processGridConcurrently(grid, concurrency = 12) {
 async function main() {
   console.log(`[${new Date().toISOString()}] Starting Greek Nationwide Gas Stations Scraper...`);
   console.log(`API: https://${API_HOST}${API_PATH} (web localStorage payload)`);
+  console.log(`Session deviceId: ${SESSION_DEVICE_ID}`);
+
+  const probeOk = await preflightProbe();
+  if (!probeOk) {
+    console.error(
+      '[!] Preflight failed: fuelgr.gr/web/api/data.php returned no usable station XML. Likely IP throttle/block.'
+    );
+    process.exit(1);
+  }
 
   const grid = generateScanGrid();
   console.log(`Generated geospatial scan grid: ${grid.length} coordinates across Greece.`);
 
-  const stations = await processGridConcurrently(grid, 12);
+  const stations = await processGridConcurrently(grid, 6);
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
 
-  // Per-fuel coverage + price sanity (web API is single-fuel per request)
   const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg' };
   for (const fid of Object.keys(FUEL_LABELS)) {
     const prices = stations
