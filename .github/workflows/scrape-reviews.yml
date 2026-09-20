@@ -29,7 +29,7 @@ concurrency:
 jobs:
   scrape-matrix:
     name: Scrape Shard ${{ matrix.shard }}/6
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -38,12 +38,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies
@@ -68,7 +68,7 @@ jobs:
 
       - name: Upload Shard Artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: reviews-shard-${{ matrix.shard }}
           path: data/reviews_shard_${{ matrix.shard }}.json
@@ -79,21 +79,21 @@ jobs:
     name: Merge Shards & Publish Release
     needs: scrape-matrix
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -111,7 +111,7 @@ jobs:
           curl -sL "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json" -o data/price_ledger.min.json || true
 
       - name: Download all shard artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: shards
 
