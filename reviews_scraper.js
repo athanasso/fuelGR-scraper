@@ -93,6 +93,10 @@ function normalizeBrand(brand) {
 function extractRatingFromPage() {
   let rating = null;
   let reviews = null;
+  let title = '';
+
+  const heading = document.querySelector('div[role="main"] h1, h1.DUwDvf, h1');
+  if (heading) title = (heading.textContent || '').trim();
 
   const f7 = document.querySelector('div.F7nice');
   if (f7) {
@@ -138,7 +142,27 @@ function extractRatingFromPage() {
     }
   }
 
-  return { rating, reviews };
+  return { rating, reviews, title };
+}
+
+function tokens(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .split(/[^a-z0-9\u0370-\u03ff]+/i)
+    .filter((t) => t.length > 2);
+}
+
+function titleMatchesStation(title, station) {
+  const name = station.name || station.n || '';
+  const address = station.address || station.a || '';
+  const want = tokens(`${name} ${address}`);
+  if (want.length === 0) return true;
+  const have = new Set(tokens(title));
+  let hits = 0;
+  for (const t of want) if (have.has(t)) hits++;
+  return hits / want.length >= 0.2 || hits >= 1;
 }
 
 /**
@@ -160,13 +184,15 @@ async function fetchGoogleReviews(page, station) {
     if (q && !queries.includes(q)) queries.push(q);
   };
 
-  // Coordinate-anchored queries match what the app opens in Maps
-  if (!isNaN(lat) && !isNaN(lng)) {
-    pushQ([brand || brandRaw, address || name, `${lat},${lng}`]);
-    pushQ([brand || brandRaw, 'πρατήριο', `${lat},${lng}`]);
+  // Prefer unique business identity over generic brand (avoids wrong nearby AEGEAN/SHELL)
+  if (name && address) pushQ([name, address]);
+  if (name) pushQ([name]);
+  if (!isNaN(lat) && !isNaN(lng) && name) {
+    pushQ([name, address || mun, `${lat},${lng}`]);
   }
-  for (const b of brandAlts.slice(0, 3)) {
-    pushQ([b, address || name, mun, 'Greece']);
+  if (brand && address) pushQ([brand, address, mun]);
+  for (const b of brandAlts.slice(0, 2)) {
+    if (address) pushQ([b, address]);
   }
   pushQ([name, address, mun, 'Greece']);
 
@@ -207,7 +233,15 @@ async function fetchGoogleReviews(page, station) {
       }
 
       const result = await page.evaluate(extractRatingFromPage);
-      if (result.rating !== null) return result;
+      // Accept only when we have a real review count and the place title looks right
+      if (
+        result.rating !== null &&
+        result.reviews !== null &&
+        result.reviews > 0 &&
+        titleMatchesStation(result.title || '', station)
+      ) {
+        return result;
+      }
       await jitter(800, 1500);
     }
 
@@ -250,13 +284,13 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
       break;
     }
 
-    if (result.rating !== null) {
+    if (result.rating !== null && result.reviews !== null && result.reviews > 0) {
       results[id] = {
         rating: result.rating,
-        reviews: result.reviews || 0,
+        reviews: result.reviews,
         ts: Math.floor(Date.now() / 1000)
       };
-      console.log(`★${result.rating} (${result.reviews || 0})`);
+      console.log(`★${result.rating} (${result.reviews})`);
     } else {
       console.log('n/a');
     }
