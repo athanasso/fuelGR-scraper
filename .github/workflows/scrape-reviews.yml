@@ -14,6 +14,10 @@ on:
         description: 'Maximum jitter delay per station in ms'
         required: false
         default: '6000'
+      refresh_days:
+        description: 'Re-fetch reviews older than N days (0 = never refresh, 1 = force almost all)'
+        required: false
+        default: '14'
 
 permissions:
   contents: write
@@ -58,8 +62,9 @@ jobs:
         run: |
           DELAY_MIN="${{ github.event.inputs.delay_min || '3000' }}"
           DELAY_MAX="${{ github.event.inputs.delay_max || '6000' }}"
-          echo "Starting shard ${{ matrix.shard }}/6 with delay=${DELAY_MIN}-${DELAY_MAX}ms..."
-          node reviews_scraper.js --shard ${{ matrix.shard }} --total-shards 6 --max-time-min 140 --refresh-days 14 --delay-min "${DELAY_MIN}" --delay-max "${DELAY_MAX}" --input data/stations_latest.min.json
+          REFRESH_DAYS="${{ github.event.inputs.refresh_days || '14' }}"
+          echo "Starting shard ${{ matrix.shard }}/6 with delay=${DELAY_MIN}-${DELAY_MAX}ms refresh-days=${REFRESH_DAYS}..."
+          node reviews_scraper.js --shard ${{ matrix.shard }} --total-shards 6 --max-time-min 140 --refresh-days "${REFRESH_DAYS}" --delay-min "${DELAY_MIN}" --delay-max "${DELAY_MAX}" --input data/stations_latest.min.json
 
       - name: Upload Shard Artifact
         if: always()
