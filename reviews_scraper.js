@@ -5,7 +5,8 @@
  * rating + review count, and outputs reviews.min.json (keyed by station id).
  *
  * Features:
- *  - Incremental: skips stations already in reviews.min.json
+ *  - Incremental: skips stations already in reviews.min.json (unless stale)
+ *  - Refresh: re-fetches entries older than --refresh-days (default 14)
  *  - Supports both raw schema (name, brand, address) and compact schema (n, b, a)
  *  - Dual-mode extraction: direct place detail (div.F7nice) + search results feed (div.Nv2PK)
  *  - Isolation: cleans page between queries to prevent SPA state bleed
@@ -14,7 +15,8 @@
  *  - Anti-bot safety: human jitter delays, CAPTCHA detection, single browser context
  *
  * Usage:
- *   node reviews_scraper.js [--limit N] [--concurrency N] [--max-time-min N] [--delay-min N] [--delay-max N] [--input path]
+ *   node reviews_scraper.js [--limit N] [--concurrency N] [--max-time-min N]
+ *     [--delay-min N] [--delay-max N] [--refresh-days N] [--input path]
  */
 
 'use strict';
@@ -35,6 +37,7 @@ const CONCURRENCY  = parseInt(getArg('--concurrency', '1'), 10);
 const DELAY_MIN    = parseInt(getArg('--delay-min', '3000'), 10);
 const DELAY_MAX    = parseInt(getArg('--delay-max', '6000'), 10);
 const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10);
+const REFRESH_DAYS = parseInt(getArg('--refresh-days', '14'), 10); // 0 = never refresh existing
 const SHARD        = parseInt(getArg('--shard', '0'), 10);
 const TOTAL_SHARDS = parseInt(getArg('--total-shards', '1'), 10);
 const INPUT_FILE   = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
@@ -74,6 +77,30 @@ async function loadExisting() {
 function saveReviews(data) {
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data), 'utf8');
+}
+
+function stationShardKey(station) {
+  const n = parseInt(String(station.id), 10);
+  if (Number.isFinite(n)) return Math.abs(n);
+  let h = 0;
+  for (const c of String(station.id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h;
+}
+
+function prefPriority(station) {
+  const PRIORITY_PREFS = [
+    'ΑΘΗΝ', 'ΑΤΤΙΚ', 'ΠΕΙΡΑΙ', 'ΘΕΣΣΑΛΟΝΙΚ', 'ΗΡΑΚΛΕΙ', 'ΑΧΑΪ', 'ΛΑΡΙΣ'
+  ];
+  const pref = (station.prefecture || station.pref || '').toUpperCase();
+  const idx = PRIORITY_PREFS.findIndex((p) => pref.includes(p));
+  return idx !== -1 ? idx : 999;
+}
+
+function isStaleEntry(entry, nowSec) {
+  if (!(REFRESH_DAYS > 0)) return false;
+  const ts = Number(entry?.ts) || 0;
+  if (!ts) return true; // legacy rows without ts → refresh
+  return nowSec - ts >= REFRESH_DAYS * 24 * 3600;
 }
 
 // ── Google Maps scraping ───────────────────────────────────────────────────────
@@ -320,6 +347,7 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
 
     process.stdout.write(`[${done.count + 1}] ${brand ? brand + ' ' : ''}${name} (${id})... `);
 
+    const hadPrior = Boolean(results[id]);
     const result = await fetchGoogleReviews(page, station);
     if (result.blocked) {
       queue.length = 0; // stop remaining requests gracefully
@@ -332,9 +360,10 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
         reviews: result.reviews,
         ts: Math.floor(Date.now() / 1000)
       };
-      console.log(`★${result.rating} (${result.reviews})`);
+      console.log(`${hadPrior ? '↻' : ''}★${result.rating} (${result.reviews})`);
     } else {
-      console.log('n/a');
+      // Keep prior rating on failed refresh — don't wipe good data
+      console.log(hadPrior ? 'n/a (kept prior)' : 'n/a');
     }
 
     done.count++;
@@ -370,31 +399,44 @@ async function main() {
     console.log(`Purged ${purged} invalid review entries (missing/zero count).`);
     saveReviews(results);
   }
-  const alreadyDone = Object.keys(results).length;
-  console.log(`${alreadyDone} stations already reviewed — skipping.`);
 
-  let queue = stations.filter(s => !results[String(s.id)]);
-
-  // Shard work across parallel matrix runners (supports 1-indexed 1..N or 0-indexed 0..N-1)
-  if (TOTAL_SHARDS > 1) {
-    const targetMod = (SHARD >= 1 && SHARD <= TOTAL_SHARDS) ? SHARD - 1 : SHARD;
-    queue = queue.filter((_, idx) => idx % TOTAL_SHARDS === targetMod);
-    console.log(`[Shard ${SHARD}/${TOTAL_SHARDS}] Assigned ${queue.length} stations.`);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const missing = [];
+  const stale = [];
+  for (const s of stations) {
+    const id = String(s.id);
+    const existing = results[id];
+    if (!existing) {
+      missing.push(s);
+    } else if (isStaleEntry(existing, nowSec)) {
+      stale.push(s);
+    }
   }
 
-  // Prioritize major urban centers: Athens/Attica, Piraeus, Thessaloniki, Patras, Heraklion
-  const PRIORITY_PREFS = [
-    'ΑΘΗΝ', 'ΑΤΤΙΚ', 'ΠΕΙΡΑΙ', 'ΘΕΣΣΑΛΟΝΙΚ', 'ΗΡΑΚΛΕΙ', 'ΑΧΑΪ', 'ΛΑΡΙΣ'
-  ];
-  queue.sort((a, b) => {
-    const prefA = (a.prefecture || a.pref || '').toUpperCase();
-    const prefB = (b.prefecture || b.pref || '').toUpperCase();
-    const idxA = PRIORITY_PREFS.findIndex(p => prefA.includes(p));
-    const idxB = PRIORITY_PREFS.findIndex(p => prefB.includes(p));
-    const scoreA = idxA !== -1 ? idxA : 999;
-    const scoreB = idxB !== -1 ? idxB : 999;
-    return scoreA - scoreB;
+  // Oldest first among refreshes so long-neglected ratings move first
+  stale.sort((a, b) => {
+    const ta = Number(results[String(a.id)]?.ts) || 0;
+    const tb = Number(results[String(b.id)]?.ts) || 0;
+    return ta - tb;
   });
+
+  missing.sort((a, b) => prefPriority(a) - prefPriority(b));
+
+  console.log(
+    `${Object.keys(results).length} stations have reviews` +
+      (REFRESH_DAYS > 0 ? ` (refresh if older than ${REFRESH_DAYS}d)` : ' (refresh disabled)') +
+      `. Missing: ${missing.length}, stale: ${stale.length}.`
+  );
+
+  // Fill gaps first, then refresh outdated ratings
+  let queue = [...missing, ...stale];
+
+  // Stable id-based sharding so the same station always lands on the same runner
+  if (TOTAL_SHARDS > 1) {
+    const targetMod = SHARD >= 1 && SHARD <= TOTAL_SHARDS ? SHARD - 1 : SHARD;
+    queue = queue.filter((s) => stationShardKey(s) % TOTAL_SHARDS === targetMod);
+    console.log(`[Shard ${SHARD}/${TOTAL_SHARDS}] Assigned ${queue.length} stations.`);
+  }
 
   if (LIMIT > 0 && queue.length > LIMIT) {
     console.log(`Applying limit: ${LIMIT} of ${queue.length} pending stations.`);
@@ -407,7 +449,7 @@ async function main() {
 
   console.log(`Queuing ${queue.length} stations with concurrency=${CONCURRENCY}, delay=${DELAY_MIN}-${DELAY_MAX}ms.`);
   if (queue.length === 0) {
-    console.log('All stations already enriched!');
+    console.log('Nothing to fetch — all reviews present and fresh.');
     return;
   }
 
