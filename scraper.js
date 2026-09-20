@@ -36,20 +36,38 @@ const MIN_PRICE = 0.4;
 const MAX_PRICE = 5.0;
 
 /**
- * Fuel type IDs to request per grid point.
- * Web API returns ONLY the selected fuel type (`f`) per call, so we must
- * scan each type separately and merge by station id. Matches app keys:
- * 1=u95, 2=u100, 4=d, 5=dh, 6=lpg
+ * Fuel type IDs the app displays.
+ * Web API returns ONLY the selected fuel (`f`) per call.
+ * We discover stations with Unleaded 95 nationwide first, then enrich
+ * other fuels on a denser subset — otherwise rate-limits kick in after
+ * ~100 calls and we only cover ~20 locations (≈150 stations).
  */
-const SCAN_FUEL_TYPES = [1, 2, 4, 5, 6];
+const DISCOVERY_FUEL = 1; // Unleaded 95
+const ENRICH_FUELS = [2, 4, 5, 6]; // u100, diesel, heating, lpg
 
-/** One stable web device id per scraper run (browser reuses localStorage deviceId). */
-const SESSION_DEVICE_ID = 'web.' + crypto.randomUUID();
+/** Rotating web device id — refreshed on empty streaks / periodically. */
+let sessionDeviceId = 'web.' + crypto.randomUUID();
+let requestsSinceDeviceRotate = 0;
+const DEVICE_ROTATE_EVERY = 75;
 
-const FETCH_STATS = { ok: 0, empty: 0, badDecode: 0, retried: 0 };
+const FETCH_STATS = {
+  ok: 0,
+  emptyBody: 0,
+  emptyStations: 0,
+  badDecode: 0,
+  retried: 0,
+  deviceRotates: 0
+};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function rotateDeviceId(reason) {
+  sessionDeviceId = 'web.' + crypto.randomUUID();
+  requestsSinceDeviceRotate = 0;
+  FETCH_STATS.deviceRotates++;
+  console.warn(`\n[i] Rotated deviceId (${reason}): ${sessionDeviceId}`);
 }
 
 /**
@@ -71,7 +89,7 @@ function buildLocalStoragePayload(lat, lng, fuelType) {
     logged_in: 'false',
     d_lat: String(lat),
     d_lng: String(lng),
-    deviceId: SESSION_DEVICE_ID,
+    deviceId: sessionDeviceId,
     mobile_user: 'false',
     sort: '0'
   });
@@ -79,6 +97,10 @@ function buildLocalStoragePayload(lat, lng, fuelType) {
 
 function looksLikeStationXml(xml) {
   return typeof xml === 'string' && (xml.includes('<gss') || xml.includes('<?xml') || xml.includes('<gs '));
+}
+
+function countGs(xml) {
+  return (xml.match(/<gs id="/g) || []).length;
 }
 
 /**
@@ -121,16 +143,17 @@ function unscrambleResponse(raw) {
 }
 
 /**
- * Generate nationwide coordinate scan grid covering Greece:
- * - Base grid across Greek landmass & islands
- * - Dense urban sampling for high-density metropolitan areas
+ * Generate scan points.
+ * mode:
+ *  - 'discovery': every geo cell with Unleaded 95 only (nationwide coverage first)
+ *  - 'enrich': other fuels on urban clusters + regional capitals only
  */
-function generateScanGrid() {
+function generateScanGrid(mode = 'discovery') {
   const points = new Map();
+  const fuelTypes =
+    mode === 'enrich' ? ENRICH_FUELS : [DISCOVERY_FUEL];
 
-  /** Register lat/lng for every fuel type the app can display. */
-  const addPoint = (lat, lng, fuelTypes = SCAN_FUEL_TYPES) => {
-    const types = Array.isArray(fuelTypes) ? fuelTypes : [fuelTypes];
+  const addPoint = (lat, lng, types = fuelTypes) => {
     for (const fuelType of types) {
       const key = `${lat.toFixed(3)}_${lng.toFixed(3)}_${fuelType}`;
       if (!points.has(key)) {
@@ -143,68 +166,50 @@ function generateScanGrid() {
     }
   };
 
-  // 1. Nationwide base grid (lat 34.8 to 41.8, lng 19.5 to 28.3)
-  for (let lat = 34.8; lat <= 41.8; lat += 0.22) {
-    for (let lng = 19.5; lng <= 28.3; lng += 0.25) {
-      if (
-        (lat >= 35.0 && lat <= 35.6 && lng >= 23.5 && lng <= 26.3) ||
-        (lat >= 35.8 && lat <= 36.6 && lng >= 27.5 && lng <= 28.3) ||
-        (lat >= 36.5 && lat <= 37.8 && lng >= 24.5 && lng <= 26.5) ||
-        (lat >= 36.4 && lat <= 38.5 && lng >= 21.0 && lng <= 23.5) ||
-        (lat >= 37.5 && lat <= 39.0 && lng >= 23.0 && lng <= 24.5) ||
-        (lat >= 38.0 && lat <= 40.0 && lng >= 20.5 && lng <= 22.5) ||
-        (lat >= 37.5 && lat <= 40.0 && lng >= 25.5 && lng <= 27.0) ||
-        (lat >= 39.5 && lat <= 41.8 && lng >= 20.5 && lng <= 26.8) ||
-        (lat >= 37.6 && lat <= 40.0 && lng >= 19.8 && lng <= 21.0)
-      ) {
-        addPoint(lat, lng);
+  const addLandGrid = () => {
+    for (let lat = 34.8; lat <= 41.8; lat += 0.22) {
+      for (let lng = 19.5; lng <= 28.3; lng += 0.25) {
+        if (
+          (lat >= 35.0 && lat <= 35.6 && lng >= 23.5 && lng <= 26.3) ||
+          (lat >= 35.8 && lat <= 36.6 && lng >= 27.5 && lng <= 28.3) ||
+          (lat >= 36.5 && lat <= 37.8 && lng >= 24.5 && lng <= 26.5) ||
+          (lat >= 36.4 && lat <= 38.5 && lng >= 21.0 && lng <= 23.5) ||
+          (lat >= 37.5 && lat <= 39.0 && lng >= 23.0 && lng <= 24.5) ||
+          (lat >= 38.0 && lat <= 40.0 && lng >= 20.5 && lng <= 22.5) ||
+          (lat >= 37.5 && lat <= 40.0 && lng >= 25.5 && lng <= 27.0) ||
+          (lat >= 39.5 && lat <= 41.8 && lng >= 20.5 && lng <= 26.8) ||
+          (lat >= 37.6 && lat <= 40.0 && lng >= 19.8 && lng <= 21.0)
+        ) {
+          addPoint(lat, lng);
+        }
       }
     }
-  }
+  };
 
-  // 2. High-density urban clusters
-  for (let lat = 37.8; lat <= 38.25; lat += 0.04) {
-    for (let lng = 23.5; lng <= 24.05; lng += 0.04) {
-      addPoint(lat, lng);
+  const addUrbanClusters = () => {
+    for (let lat = 37.8; lat <= 38.25; lat += 0.04) {
+      for (let lng = 23.5; lng <= 24.05; lng += 0.04) addPoint(lat, lng);
     }
-  }
+    for (let lat = 40.5; lat <= 40.75; lat += 0.04) {
+      for (let lng = 22.8; lng <= 23.15; lng += 0.04) addPoint(lat, lng);
+    }
+    for (let lat = 38.18; lat <= 38.3; lat += 0.04) {
+      for (let lng = 21.68; lng <= 21.8; lng += 0.04) addPoint(lat, lng);
+    }
+    for (let lat = 39.3; lat <= 39.68; lat += 0.06) {
+      for (let lng = 22.35; lng <= 23.0; lng += 0.06) addPoint(lat, lng);
+    }
+    for (let lat = 35.26; lat <= 35.36; lat += 0.04) {
+      for (let lng = 25.08; lng <= 25.18; lng += 0.04) addPoint(lat, lng);
+    }
+    for (let lat = 35.48; lat <= 35.54; lat += 0.04) {
+      for (let lng = 23.98; lng <= 24.06; lng += 0.04) addPoint(lat, lng);
+    }
+    for (let lat = 36.38; lat <= 36.46; lat += 0.04) {
+      for (let lng = 28.18; lng <= 28.24; lng += 0.04) addPoint(lat, lng);
+    }
+  };
 
-  for (let lat = 40.5; lat <= 40.75; lat += 0.04) {
-    for (let lng = 22.8; lng <= 23.15; lng += 0.04) {
-      addPoint(lat, lng);
-    }
-  }
-
-  for (let lat = 38.18; lat <= 38.3; lat += 0.04) {
-    for (let lng = 21.68; lng <= 21.8; lng += 0.04) {
-      addPoint(lat, lng);
-    }
-  }
-
-  for (let lat = 39.3; lat <= 39.68; lat += 0.06) {
-    for (let lng = 22.35; lng <= 23.0; lng += 0.06) {
-      addPoint(lat, lng);
-    }
-  }
-
-  for (let lat = 35.26; lat <= 35.36; lat += 0.04) {
-    for (let lng = 25.08; lng <= 25.18; lng += 0.04) {
-      addPoint(lat, lng);
-    }
-  }
-  for (let lat = 35.48; lat <= 35.54; lat += 0.04) {
-    for (let lng = 23.98; lng <= 24.06; lng += 0.04) {
-      addPoint(lat, lng);
-    }
-  }
-
-  for (let lat = 36.38; lat <= 36.46; lat += 0.04) {
-    for (let lng = 28.18; lng <= 28.24; lng += 0.04) {
-      addPoint(lat, lng);
-    }
-  }
-
-  // 3. Regional capitals (same multi-fuel scan as the base grid)
   const REGIONAL_CENTERS = [
     [37.9838, 23.7275], [40.6401, 22.9444], [38.2466, 21.7346], [35.3387, 25.1442],
     [39.6390, 22.4191], [39.3622, 22.9422], [39.6650, 20.8537], [37.0389, 22.1142],
@@ -224,8 +229,14 @@ function generateScanGrid() {
     [37.1036, 25.3764], [37.0850, 25.1489], [39.9167, 25.2500], [35.8500, 27.1333]
   ];
 
-  for (const [cLat, cLng] of REGIONAL_CENTERS) {
-    addPoint(cLat, cLng);
+  if (mode === 'discovery') {
+    addLandGrid();
+    addUrbanClusters();
+    for (const [cLat, cLng] of REGIONAL_CENTERS) addPoint(cLat, cLng);
+  } else {
+    // Enrichment: denser areas only — fewer calls, still covers most multi-fuel stations
+    addUrbanClusters();
+    for (const [cLat, cLng] of REGIONAL_CENTERS) addPoint(cLat, cLng);
   }
 
   return Array.from(points.values());
@@ -288,24 +299,40 @@ async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     if (i > 0) {
       FETCH_STATS.retried++;
-      await sleep(400 * i + Math.floor(Math.random() * 200));
+      await sleep(600 * i + Math.floor(Math.random() * 300));
     }
+
+    if (requestsSinceDeviceRotate >= DEVICE_ROTATE_EVERY) {
+      rotateDeviceId(`every ${DEVICE_ROTATE_EVERY} requests`);
+    }
+
     const { status, raw } = await fetchRaw(lat, lng, fuelType);
+    requestsSinceDeviceRotate++;
+
     if (!raw || raw.length < 4) {
-      FETCH_STATS.empty++;
+      FETCH_STATS.emptyBody++;
       continue;
     }
     const xml = unscrambleResponse(raw);
-    if (looksLikeStationXml(xml)) {
-      FETCH_STATS.ok++;
-      return xml;
+    if (!looksLikeStationXml(xml)) {
+      FETCH_STATS.badDecode++;
+      if (FETCH_STATS.badDecode <= 3) {
+        console.warn(
+          `\n[warn] bad decode status=${status} rawLen=${raw.length} mod3=${raw.length % 3} head=${raw.slice(0, 48)}`
+        );
+      }
+      continue;
     }
-    FETCH_STATS.badDecode++;
-    if (i === attempts - 1 && FETCH_STATS.badDecode <= 3) {
-      console.warn(
-        `\n[warn] bad decode status=${status} rawLen=${raw.length} mod3=${raw.length % 3} head=${raw.slice(0, 48)}`
-      );
+
+    const gs = countGs(xml);
+    if (gs === 0) {
+      FETCH_STATS.emptyStations++;
+      // Throttle signal: valid envelope, no stations for a land point
+      continue;
     }
+
+    FETCH_STATS.ok++;
+    return xml;
   }
   return '';
 }
@@ -321,6 +348,7 @@ async function preflightProbe() {
       return true;
     }
     console.warn(`Preflight attempt ${attempt}/5 failed; backing off...`);
+    rotateDeviceId('preflight miss');
     await sleep(2000 * attempt);
   }
   return false;
@@ -438,23 +466,26 @@ function mergeStation(existing, incoming) {
 }
 
 /**
- * Worker pool to process grid points concurrently (kept modest to avoid CF throttling).
+ * Worker pool — backs off and rotates deviceId when the API returns empty envelopes.
  */
-async function processGridConcurrently(grid, concurrency = 6) {
+async function processGridConcurrently(grid, concurrency = 5, label = 'Scan') {
   const uniqueStations = new Map();
   let completed = 0;
   let cursor = 0;
+  let emptyStreak = 0;
 
   async function worker() {
     while (cursor < grid.length) {
       const idx = cursor++;
       const point = grid[idx];
+      let added = 0;
       try {
         const xml = await fetchCoordinates(point.lat, point.lng, point.fuelType);
         const list = parseXmlStations(xml);
         for (const s of list) {
           if (!uniqueStations.has(s.id)) {
             uniqueStations.set(s.id, s);
+            added++;
           } else {
             uniqueStations.set(s.id, mergeStation(uniqueStations.get(s.id), s));
           }
@@ -462,14 +493,24 @@ async function processGridConcurrently(grid, concurrency = 6) {
       } catch {
         // skip failed point
       }
-      // Gentle pacing — datacenter IPs get throttled under burst load
-      await sleep(40 + Math.floor(Math.random() * 40));
+
+      if (added === 0) {
+        emptyStreak++;
+        if (emptyStreak > 0 && emptyStreak % 25 === 0) {
+          rotateDeviceId(`empty streak ${emptyStreak}`);
+          await sleep(2500 + Math.floor(Math.random() * 1500));
+        }
+      } else {
+        emptyStreak = 0;
+      }
+
+      await sleep(60 + Math.floor(Math.random() * 80));
       completed++;
-      if (completed % 50 === 0 || completed === grid.length) {
+      if (completed % 25 === 0 || completed === grid.length) {
         process.stdout.write(
-          `\r[Scan Progress] ${completed}/${grid.length} points (${Math.round(
+          `\r[${label}] ${completed}/${grid.length} (${Math.round(
             (completed / grid.length) * 100
-          )}%) -> ${uniqueStations.size} unique stations`
+          )}%) -> ${uniqueStations.size} stations`
         );
       }
     }
@@ -477,18 +518,14 @@ async function processGridConcurrently(grid, concurrency = 6) {
 
   const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.all(workers);
-  console.log('\nScan completed.');
-  console.log(
-    `Fetch stats: ok=${FETCH_STATS.ok} empty=${FETCH_STATS.empty} badDecode=${FETCH_STATS.badDecode} retried=${FETCH_STATS.retried}`
-  );
-
-  return Array.from(uniqueStations.values());
+  console.log(`\n[${label}] done.`);
+  return uniqueStations;
 }
 
 async function main() {
   console.log(`[${new Date().toISOString()}] Starting Greek Nationwide Gas Stations Scraper...`);
   console.log(`API: https://${API_HOST}${API_PATH} (web localStorage payload)`);
-  console.log(`Session deviceId: ${SESSION_DEVICE_ID}`);
+  console.log(`Session deviceId: ${sessionDeviceId}`);
 
   const probeOk = await preflightProbe();
   if (!probeOk) {
@@ -498,11 +535,27 @@ async function main() {
     process.exit(1);
   }
 
-  const grid = generateScanGrid();
-  console.log(`Generated geospatial scan grid: ${grid.length} coordinates across Greece.`);
+  // Phase 1: nationwide Unleaded 95 discovery (maximize geo coverage before rate limits)
+  const discoveryGrid = generateScanGrid('discovery');
+  console.log(`Phase 1 discovery grid: ${discoveryGrid.length} points (fuel=${DISCOVERY_FUEL}).`);
+  const stationsMap = await processGridConcurrently(discoveryGrid, 5, 'Discovery');
+  console.log(`Phase 1 extracted ${stationsMap.size} unique stations.`);
 
-  const stations = await processGridConcurrently(grid, 6);
+  // Phase 2: other fuels on urban/regional points only
+  rotateDeviceId('start enrich phase');
+  const enrichGrid = generateScanGrid('enrich');
+  console.log(`Phase 2 enrich grid: ${enrichGrid.length} points (fuels=${ENRICH_FUELS.join(',')}).`);
+  const enrichMap = await processGridConcurrently(enrichGrid, 4, 'Enrich');
+  for (const [id, s] of enrichMap) {
+    if (!stationsMap.has(id)) stationsMap.set(id, s);
+    else stationsMap.set(id, mergeStation(stationsMap.get(id), s));
+  }
+
+  const stations = Array.from(stationsMap.values());
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
+  console.log(
+    `Fetch stats: ok=${FETCH_STATS.ok} emptyBody=${FETCH_STATS.emptyBody} emptyStations=${FETCH_STATS.emptyStations} badDecode=${FETCH_STATS.badDecode} retried=${FETCH_STATS.retried} deviceRotates=${FETCH_STATS.deviceRotates}`
+  );
 
   const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg' };
   for (const fid of Object.keys(FUEL_LABELS)) {

@@ -77,106 +77,141 @@ function saveReviews(data) {
 }
 
 // ── Google Maps scraping ───────────────────────────────────────────────────────
+function normalizeBrand(brand) {
+  // "ΑΙΓΑΙΟ (AEGEAN)" -> prefer "AEGEAN" for Maps indexing
+  const raw = (brand || '').trim();
+  if (!raw) return { primary: '', alts: [] };
+  const paren = raw.match(/\(([^)]+)\)/);
+  const withoutParen = raw.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  const alts = [];
+  if (paren) alts.push(paren[1].trim());
+  if (withoutParen && withoutParen !== raw) alts.push(withoutParen);
+  const primary = paren ? paren[1].trim() : withoutParen || raw;
+  return { primary, alts: [...new Set([raw, withoutParen, ...alts].filter(Boolean))] };
+}
+
+function extractRatingFromPage() {
+  let rating = null;
+  let reviews = null;
+
+  const f7 = document.querySelector('div.F7nice');
+  if (f7) {
+    const txt = f7.textContent || '';
+    const rMatch = txt.match(/([1-5][.,][0-9])/);
+    if (rMatch) rating = parseFloat(rMatch[1].replace(',', '.'));
+    const cMatch = txt.match(/\(([0-9.,]+)\)/) || txt.match(/([0-9.,]+)\s*(?:αξιολογ|review|κριτικ)/i);
+    if (cMatch) {
+      const count = parseInt(cMatch[1].replace(/[.,]/g, ''), 10);
+      if (!isNaN(count)) reviews = count;
+    }
+  }
+
+  if (rating === null) {
+    const firstR = document.querySelector('span.MW4etd, span.ceNzKf');
+    if (firstR) {
+      const m = (firstR.textContent || firstR.getAttribute('aria-label') || '').match(/([1-5][.,][0-9])/);
+      if (m) rating = parseFloat(m[1].replace(',', '.'));
+    }
+  }
+  if (reviews === null) {
+    const firstC = document.querySelector('span.UY7F9');
+    if (firstC) {
+      const m =
+        (firstC.textContent || firstC.getAttribute('aria-label') || '').match(/\(([0-9.,]+)\)/) ||
+        (firstC.textContent || '').match(/([0-9.,]+)/);
+      if (m) {
+        const count = parseInt(m[1].replace(/[.,]/g, ''), 10);
+        if (!isNaN(count)) reviews = count;
+      }
+    }
+  }
+
+  if (rating === null) {
+    for (const el of document.querySelectorAll(
+      'div[role="main"] [aria-label*="star"], div[role="main"] [aria-label*="αστέρ"]'
+    )) {
+      const m = (el.getAttribute('aria-label') || '').match(/([1-5][.,][0-9])\s*(?:αστέρ|star)/i);
+      if (m) {
+        rating = parseFloat(m[1].replace(',', '.'));
+        break;
+      }
+    }
+  }
+
+  return { rating, reviews };
+}
+
 /**
  * Extracts rating and review count from a Google Maps business page.
  * Returns { rating: number|null, reviews: number|null, blocked?: boolean }.
  */
 async function fetchGoogleReviews(page, station) {
-  const brand = (station.brand || station.b || '').trim();
+  const brandRaw = (station.brand || station.b || '').trim();
   const name = (station.name || station.n || '').trim();
   const address = (station.address || station.a || '').trim();
   const mun = (station.municipality || station.mun || '').trim();
+  const lat = Number(station.lat ?? station.latitude);
+  const lng = Number(station.lng ?? station.longitude);
+  const { primary: brand, alts: brandAlts } = normalizeBrand(brandRaw);
 
-  // Search query prioritized for best Google Maps resolution:
-  // e.g. "SHELL ΑΘΗΝΑΣ 43 ΒΟΥΛΙΑΓΜΕΝΗ Greece" or "EKO ΠΑΛΑΙΟΧΩΡΑ ΧΑΝΙΑ Greece"
-  const queryParts = [brand, address || name, mun, 'Greece'].filter(Boolean);
-  const query = encodeURIComponent(queryParts.join(' '));
-  const url = `https://www.google.com/maps/search/${query}`;
+  const queries = [];
+  const pushQ = (parts) => {
+    const q = parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    if (q && !queries.includes(q)) queries.push(q);
+  };
+
+  // Coordinate-anchored queries match what the app opens in Maps
+  if (!isNaN(lat) && !isNaN(lng)) {
+    pushQ([brand || brandRaw, address || name, `${lat},${lng}`]);
+    pushQ([brand || brandRaw, 'πρατήριο', `${lat},${lng}`]);
+  }
+  for (const b of brandAlts.slice(0, 3)) {
+    pushQ([b, address || name, mun, 'Greece']);
+  }
+  pushQ([name, address, mun, 'Greece']);
 
   try {
-    // Reset state before navigation to prevent Single Page App DOM leaking from previous place
-    await page.goto('about:blank');
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    for (let qi = 0; qi < Math.min(queries.length, 3); qi++) {
+      const url = `https://www.google.com/maps/search/${encodeURIComponent(queries[qi])}`;
 
-    // Check if Google blocked this IP with a CAPTCHA
-    if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
-      console.warn('\n[!] Google rate-limit or CAPTCHA detected on current runner IP.');
-      return { rating: null, reviews: null, blocked: true };
+      await page.goto('about:blank');
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+      if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
+        console.warn('\n[!] Google rate-limit or CAPTCHA detected on current runner IP.');
+        return { rating: null, reviews: null, blocked: true };
+      }
+
+      try {
+        const consentBtn = await page.$(
+          'button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button'
+        );
+        if (consentBtn) {
+          await consentBtn.click();
+          await page.waitForTimeout(1000);
+        }
+      } catch {}
+
+      await page
+        .waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 3500 })
+        .catch(() => {});
+
+      if (!page.url().includes('/place/')) {
+        const firstCard = await page.$(
+          'div.Nv2PK a.hfpxzc, div.Nv2PK [role="article"], [role="feed"] [role="article"]'
+        );
+        if (firstCard) {
+          await firstCard.click();
+          await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2500 }).catch(() => {});
+        }
+      }
+
+      const result = await page.evaluate(extractRatingFromPage);
+      if (result.rating !== null) return result;
+      await jitter(800, 1500);
     }
 
-    // Bypass Google Consent screen if present
-    try {
-      const consentBtn = await page.$('button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button');
-      if (consentBtn) {
-        await consentBtn.click();
-        await page.waitForTimeout(1000);
-      }
-    } catch {}
-
-    // Dynamic wait for place detail header or search result feed
-    await page.waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 3500 }).catch(() => {});
-
-    // If search results list (div.Nv2PK) appeared, click the first place card
-    if (!page.url().includes('/place/')) {
-      const firstCard = await page.$('div.Nv2PK a.hfpxzc, div.Nv2PK [role="article"], [role="feed"] [role="article"]');
-      if (firstCard) {
-        await firstCard.click();
-        await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2500 }).catch(() => {});
-      }
-    }
-
-    // Extract rating and reviews
-    const result = await page.evaluate(() => {
-      let rating = null;
-      let reviews = null;
-
-      // 1. Direct place header (div.F7nice)
-      const f7 = document.querySelector('div.F7nice');
-      if (f7) {
-        const txt = f7.textContent || '';
-        const rMatch = txt.match(/([1-5][.,][0-9])/);
-        if (rMatch) rating = parseFloat(rMatch[1].replace(',', '.'));
-        const cMatch = txt.match(/\(([0-9.,]+)\)/) || txt.match(/([0-9.,]+)\s*(?:αξιολογ|review|κριτικ)/i);
-        if (cMatch) {
-          const count = parseInt(cMatch[1].replace(/[.,]/g, ''), 10);
-          if (!isNaN(count)) reviews = count;
-        }
-      }
-
-      // 2. Feed cards if detail panel didn't open
-      if (rating === null) {
-        const firstR = document.querySelector('span.MW4etd, span.ceNzKf');
-        if (firstR) {
-          const m = (firstR.textContent || firstR.getAttribute('aria-label') || '').match(/([1-5][.,][0-9])/);
-          if (m) rating = parseFloat(m[1].replace(',', '.'));
-        }
-      }
-      if (reviews === null) {
-        const firstC = document.querySelector('span.UY7F9');
-        if (firstC) {
-          const m = (firstC.textContent || firstC.getAttribute('aria-label') || '').match(/\(([0-9.,]+)\)/) || (firstC.textContent || '').match(/([0-9.,]+)/);
-          if (m) {
-            const count = parseInt(m[1].replace(/[.,]/g, ''), 10);
-            if (!isNaN(count)) reviews = count;
-          }
-        }
-      }
-
-      // 3. Fallback to place header text if div.F7nice had different class
-      if (rating === null) {
-        for (const el of document.querySelectorAll('div[role="main"] [aria-label*="star"], div[role="main"] [aria-label*="αστέρ"]')) {
-          const m = (el.getAttribute('aria-label') || '').match(/([1-5][.,][0-9])\s*(?:αστέρ|star)/i);
-          if (m) {
-            rating = parseFloat(m[1].replace(',', '.'));
-            break;
-          }
-        }
-      }
-
-      return { rating, reviews };
-    });
-
-    return result;
+    return { rating: null, reviews: null };
   } catch (err) {
     return { rating: null, reviews: null };
   }
