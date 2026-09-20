@@ -358,6 +358,18 @@ async function main() {
   console.log(`Loaded ${stations.length} stations.`);
 
   const results = await loadExisting();
+  // Drop bogus star-with-zero-reviews entries so they get re-scraped
+  let purged = 0;
+  for (const [id, r] of Object.entries(results)) {
+    if (!r || typeof r.rating !== 'number' || !(Number(r.reviews) > 0)) {
+      delete results[id];
+      purged++;
+    }
+  }
+  if (purged > 0) {
+    console.log(`Purged ${purged} invalid review entries (missing/zero count).`);
+    saveReviews(results);
+  }
   const alreadyDone = Object.keys(results).length;
   console.log(`${alreadyDone} stations already reviewed — skipping.`);
 
