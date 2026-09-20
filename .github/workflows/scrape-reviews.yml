@@ -15,7 +15,7 @@ on:
         required: false
         default: '6000'
       refresh_days:
-        description: 'Re-fetch reviews older than N days (0 = never refresh, 1 = force almost all)'
+        description: 'Re-fetch if older than N days. Use -1 to re-fetch ALL. 0 = never refresh existing.'
         required: false
         default: '14'
 

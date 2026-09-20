@@ -6,7 +6,7 @@
  *
  * Features:
  *  - Incremental: skips stations already in reviews.min.json (unless stale)
- *  - Refresh: re-fetches entries older than --refresh-days (default 14)
+ *  - Refresh: re-fetches entries older than --refresh-days (default 14; -1 = all)
  *  - Supports both raw schema (name, brand, address) and compact schema (n, b, a)
  *  - Dual-mode extraction: direct place detail (div.F7nice) + search results feed (div.Nv2PK)
  *  - Isolation: cleans page between queries to prevent SPA state bleed
@@ -37,7 +37,7 @@ const CONCURRENCY  = parseInt(getArg('--concurrency', '1'), 10);
 const DELAY_MIN    = parseInt(getArg('--delay-min', '3000'), 10);
 const DELAY_MAX    = parseInt(getArg('--delay-max', '6000'), 10);
 const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10);
-const REFRESH_DAYS = parseInt(getArg('--refresh-days', '14'), 10); // 0 = never refresh existing
+const REFRESH_DAYS = parseInt(getArg('--refresh-days', '14'), 10); // -1 = force all, 0 = never
 const SHARD        = parseInt(getArg('--shard', '0'), 10);
 const TOTAL_SHARDS = parseInt(getArg('--total-shards', '1'), 10);
 const INPUT_FILE   = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
@@ -97,6 +97,8 @@ function prefPriority(station) {
 }
 
 function isStaleEntry(entry, nowSec) {
+  // -1 = force refresh every existing entry
+  if (REFRESH_DAYS < 0) return true;
   if (!(REFRESH_DAYS > 0)) return false;
   const ts = Number(entry?.ts) || 0;
   if (!ts) return true; // legacy rows without ts → refresh
@@ -424,7 +426,11 @@ async function main() {
 
   console.log(
     `${Object.keys(results).length} stations have reviews` +
-      (REFRESH_DAYS > 0 ? ` (refresh if older than ${REFRESH_DAYS}d)` : ' (refresh disabled)') +
+      (REFRESH_DAYS < 0
+        ? ' (FORCE refresh all)'
+        : REFRESH_DAYS > 0
+          ? ` (refresh if older than ${REFRESH_DAYS}d)`
+          : ' (refresh disabled)') +
       `. Missing: ${missing.length}, stale: ${stale.length}.`
   );
 
