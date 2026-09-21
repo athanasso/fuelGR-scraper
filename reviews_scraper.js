@@ -2,10 +2,8 @@
  * FuelGR Google Reviews Enrichment Scraper
  *
  * Reads stations_latest.min.json, queries Google Maps for each station's
- * rating + review count, and outputs reviews.min.json (keyed by station id).
- *
- * Features:
- *  - Incremental: skips stations already in reviews.min.json (unless stale)
+ *  - Outputs rating + review count + Maps place link (mu / pid) keyed by station id
+ *  - Incremental: skips stations already in reviews.min.json (unless stale / missing Maps link)
  *  - Refresh: re-fetches entries older than --refresh-days (default 14; -1 = all)
  *  - Supports both raw schema (name, brand, address) and compact schema (n, b, a)
  *  - Dual-mode extraction: direct place detail (div.F7nice) + search results feed (div.Nv2PK)
@@ -194,6 +192,38 @@ function tokens(s) {
     .filter((t) => t.length > 2);
 }
 
+function sanitizeMapsLink(pageUrl, placeId) {
+  if (placeId && /^ChIJ[\w-]+$/.test(placeId)) {
+    return `https://www.google.com/maps/search/?api=1&query=place&query_place_id=${placeId}`;
+  }
+  const href = String(pageUrl || '');
+  // Feature id → cid deep link (opens exact listing)
+  const hex = href.match(/!1s0x[0-9a-f]+:0x([0-9a-f]+)/i);
+  if (hex) {
+    try {
+      const cid = BigInt(`0x${hex[1]}`).toString();
+      return `https://maps.google.com/?cid=${cid}`;
+    } catch {}
+  }
+  if (href.includes('/maps/place/')) {
+    try {
+      const u = new URL(href);
+      return `${u.origin}${u.pathname}`;
+    } catch {}
+  }
+  return null;
+}
+
+function extractPlaceMetaFromUrl(pageUrl) {
+  const href = String(pageUrl || '');
+  let placeId = null;
+  const chij =
+    href.match(/[?&](?:query_)?place_id=(ChIJ[\w-]+)/i) ||
+    href.match(/!1s(ChIJ[\w-]+)/);
+  if (chij) placeId = chij[1];
+  return { placeId, mapsUrl: sanitizeMapsLink(href, placeId) };
+}
+
 function titleMatchesStation(title, station, subtitle = '') {
   const name = station.name || station.n || '';
   const address = station.address || station.a || '';
@@ -340,7 +370,21 @@ async function fetchGoogleReviews(page, station, state) {
         result.reviews > 0 &&
         titleMatchesStation(result.title || '', station, result.subtitle || '')
       ) {
-        return result;
+        // Capture Maps place link from the live page (for the app to open the exact listing)
+        let placeId = null;
+        let mapsUrl = null;
+        try {
+          const meta = await page.evaluate(() => {
+            const href = location.href || '';
+            const html = document.documentElement.innerHTML.slice(0, 250000);
+            const chij = html.match(/ChIJ[a-zA-Z0-9_-]{22,}/);
+            return { href, placeId: chij ? chij[0] : null };
+          });
+          const fromUrl = extractPlaceMetaFromUrl(meta.href);
+          placeId = meta.placeId || fromUrl.placeId || null;
+          mapsUrl = sanitizeMapsLink(meta.href, placeId) || fromUrl.mapsUrl;
+        } catch {}
+        return { ...result, placeId, mapsUrl };
       }
       if (qi < 2) await jitter(400, 900);
     }
@@ -397,12 +441,21 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
     }
 
     if (result.rating !== null && result.reviews !== null && result.reviews > 0) {
-      results[id] = {
+      const prior = results[id] || {};
+      const entry = {
         rating: result.rating,
         reviews: result.reviews,
         ts: Math.floor(Date.now() / 1000)
       };
-      console.log(`${hadPrior ? '↻' : ''}★${result.rating} (${result.reviews})`);
+      if (result.placeId) entry.pid = result.placeId;
+      else if (prior.pid) entry.pid = prior.pid;
+      if (result.mapsUrl) entry.mu = result.mapsUrl;
+      else if (prior.mu) entry.mu = prior.mu;
+      results[id] = entry;
+      console.log(
+        `${hadPrior ? '↻' : ''}★${result.rating} (${result.reviews})` +
+          (entry.mu || entry.pid ? ' 🔗' : '')
+      );
     } else {
       // Keep prior rating on failed refresh — don't wipe good data
       console.log(hadPrior ? 'n/a (kept prior)' : 'n/a');
@@ -450,7 +503,8 @@ async function main() {
     const existing = results[id];
     if (!existing) {
       missing.push(s);
-    } else if (isStaleEntry(existing, nowSec)) {
+    } else if (isStaleEntry(existing, nowSec) || !(existing.mu || existing.pid)) {
+      // Re-fetch stale ratings, and backfill Maps place links when missing
       stale.push(s);
     }
   }

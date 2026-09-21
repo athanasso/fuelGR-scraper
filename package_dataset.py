@@ -286,6 +286,11 @@ def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]
             if rating is not None and count is not None and int(count) > 0:
                 master_item["mr"] = round(float(rating), 1)
                 master_item["mc"] = int(count)
+                # Maps deep link captured by reviews scraper (exact place listing)
+                if rev.get("pid"):
+                    master_item["mp"] = str(rev["pid"])
+                if rev.get("mu"):
+                    master_item["mu"] = str(rev["mu"])[:512]
 
     detailed_history = {
         "id": st_id,
