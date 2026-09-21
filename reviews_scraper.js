@@ -104,6 +104,17 @@ function isStaleEntry(entry, nowSec) {
   return nowSec - ts >= REFRESH_DAYS * 24 * 3600;
 }
 
+function hasValidMapsLink(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  const mu = String(entry.mu || '');
+  if (/[?&]cid=\d{6,}/.test(mu)) return true;
+  if (/query_place_id=ChIJ[a-zA-Z0-9_-]{20,40}/.test(mu)) return true;
+  const pid = String(entry.pid || '');
+  if (/^cid:\d{6,}$/.test(pid)) return true;
+  if (/^ChIJ[a-zA-Z0-9_-]{23,35}$/.test(pid)) return true;
+  return false;
+}
+
 // ── Google Maps scraping ───────────────────────────────────────────────────────
 function normalizeBrand(brand) {
   // "ΑΙΓΑΙΟ (AEGEAN)" -> prefer "AEGEAN" for Maps indexing
@@ -192,36 +203,51 @@ function tokens(s) {
     .filter((t) => t.length > 2);
 }
 
-function sanitizeMapsLink(pageUrl, placeId) {
-  if (placeId && /^ChIJ[\w-]+$/.test(placeId)) {
-    return `https://www.google.com/maps/search/?api=1&query=place&query_place_id=${placeId}`;
-  }
+/** Build a stable single-place Maps deep link from a /place/ URL or page HTML. */
+function buildMapsDeepLink(pageUrl, html) {
   const href = String(pageUrl || '');
-  // Feature id → cid deep link (opens exact listing)
-  const hex = href.match(/!1s0x[0-9a-f]+:0x([0-9a-f]+)/i);
-  if (hex) {
-    try {
-      const cid = BigInt(`0x${hex[1]}`).toString();
-      return `https://maps.google.com/?cid=${cid}`;
-    } catch {}
-  }
-  if (href.includes('/maps/place/')) {
-    try {
-      const u = new URL(href);
-      return `${u.origin}${u.pathname}`;
-    } catch {}
-  }
-  return null;
-}
+  const blob = `${href}\n${String(html || '').slice(0, 300000)}`;
 
-function extractPlaceMetaFromUrl(pageUrl) {
-  const href = String(pageUrl || '');
-  let placeId = null;
-  const chij =
-    href.match(/[?&](?:query_)?place_id=(ChIJ[\w-]+)/i) ||
-    href.match(/!1s(ChIJ[\w-]+)/);
-  if (chij) placeId = chij[1];
-  return { placeId, mapsUrl: sanitizeMapsLink(href, placeId) };
+  // 1) Most reliable on scraped Maps pages: !1s0x…:0x… → ?cid=
+  const feat = blob.match(/!1s(0x[0-9a-f]+):(0x[0-9a-f]+)/i);
+  if (feat) {
+    try {
+      const cid = BigInt(feat[2]).toString();
+      return {
+        pid: `cid:${cid}`,
+        mu: `https://www.google.com/maps?cid=${cid}`
+      };
+    } catch {}
+  }
+
+  // 2) Explicit place_id= / query_place_id=
+  const qid = href.match(/[?&](?:query_)?place_id=(ChIJ[a-zA-Z0-9_-]{20,40})/i);
+  if (qid) {
+    return {
+      pid: qid[1],
+      mu: `https://www.google.com/maps/search/?api=1&query=station&query_place_id=${qid[1]}`
+    };
+  }
+
+  // 3) Strict ChIJ token only (avoid greedy HTML matches gluing ids together)
+  const chij = blob.match(/\b(ChIJ[a-zA-Z0-9_-]{23,35})\b/);
+  if (chij) {
+    return {
+      pid: chij[1],
+      mu: `https://www.google.com/maps/search/?api=1&query=station&query_place_id=${chij[1]}`
+    };
+  }
+
+  // 4) ludocid / cid= already in URL
+  const cidParam = href.match(/[?&]cid=(\d{6,})/i) || blob.match(/ludocid[=:](\d{6,})/i);
+  if (cidParam) {
+    return {
+      pid: `cid:${cidParam[1]}`,
+      mu: `https://www.google.com/maps?cid=${cidParam[1]}`
+    };
+  }
+
+  return { pid: null, mu: null };
 }
 
 function titleMatchesStation(title, station, subtitle = '') {
@@ -370,20 +396,33 @@ async function fetchGoogleReviews(page, station, state) {
         result.reviews > 0 &&
         titleMatchesStation(result.title || '', station, result.subtitle || '')
       ) {
-        // Capture Maps place link from the live page (for the app to open the exact listing)
+        // Wait for Maps SPA to settle on the /place/ URL (needed for !1s0x…:0x… / cid)
+        try {
+          await page
+            .waitForFunction(
+              () => /\/maps\/place\//.test(location.href) || /!1s0x/i.test(location.href),
+              null,
+              { timeout: 3500 }
+            )
+            .catch(() => {});
+          await page.waitForTimeout(400);
+        } catch {}
+
         let placeId = null;
         let mapsUrl = null;
         try {
           const meta = await page.evaluate(() => {
-            const href = location.href || '';
-            const html = document.documentElement.innerHTML.slice(0, 250000);
-            const chij = html.match(/ChIJ[a-zA-Z0-9_-]{22,}/);
-            return { href, placeId: chij ? chij[0] : null };
+            const can = document.querySelector('link[rel="canonical"]')?.href || '';
+            return {
+              href: can || location.href || '',
+              html: document.documentElement.innerHTML.slice(0, 280000)
+            };
           });
-          const fromUrl = extractPlaceMetaFromUrl(meta.href);
-          placeId = meta.placeId || fromUrl.placeId || null;
-          mapsUrl = sanitizeMapsLink(meta.href, placeId) || fromUrl.mapsUrl;
+          const link = buildMapsDeepLink(meta.href || page.url(), meta.html);
+          placeId = link.pid;
+          mapsUrl = link.mu;
         } catch {}
+
         return { ...result, placeId, mapsUrl };
       }
       if (qi < 2) await jitter(400, 900);
@@ -503,8 +542,8 @@ async function main() {
     const existing = results[id];
     if (!existing) {
       missing.push(s);
-    } else if (isStaleEntry(existing, nowSec) || !(existing.mu || existing.pid)) {
-      // Re-fetch stale ratings, and backfill Maps place links when missing
+    } else if (isStaleEntry(existing, nowSec) || !hasValidMapsLink(existing)) {
+      // Re-fetch stale ratings, and backfill Maps place links when missing/invalid
       stale.push(s);
     }
   }
