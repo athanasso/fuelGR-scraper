@@ -91,6 +91,28 @@ async function main() {
   }
   if (purged > 0) console.log(`Purged ${purged} invalid review entries from merge.`);
 
+  // Same Maps cid on 2+ stations = wrong neighbour match — strip links so they re-scrape
+  const byCid = {};
+  for (const [id, r] of Object.entries(merged)) {
+    const mu = String(r.mu || '');
+    const pid = String(r.pid || '');
+    const m = mu.match(/[?&]cid=(\d+)/) || pid.match(/^cid:(\d+)$/);
+    if (!m) continue;
+    (byCid[m[1]] = byCid[m[1]] || []).push(id);
+  }
+  let dupLinks = 0;
+  for (const ids of Object.values(byCid)) {
+    if (ids.length < 2) continue;
+    for (const id of ids) {
+      delete merged[id].mu;
+      delete merged[id].pid;
+      dupLinks++;
+    }
+  }
+  if (dupLinks > 0) {
+    console.log(`Cleared Maps links on ${dupLinks} stations sharing a duplicate cid (will re-scrape).`);
+  }
+
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(merged), 'utf8');
   console.log(`\nSuccessfully merged ${shardCount} shards! Total stations with reviews: ${Object.keys(merged).length}.`);

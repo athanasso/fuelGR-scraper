@@ -203,24 +203,49 @@ function tokens(s) {
     .filter((t) => t.length > 2);
 }
 
-/** Build a stable single-place Maps deep link from a /place/ URL or page HTML. */
-function buildMapsDeepLink(pageUrl, html) {
-  const href = String(pageUrl || '');
-  const blob = `${href}\n${String(html || '').slice(0, 300000)}`;
+function haversineM(aLat, aLng, bLat, bLng) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const lat1 = toRad(aLat);
+  const lat2 = toRad(bLat);
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
 
-  // 1) Most reliable on scraped Maps pages: !1s0x…:0x… → ?cid=
-  const feat = blob.match(/!1s(0x[0-9a-f]+):(0x[0-9a-f]+)/i);
+function coordsFromMapsUrl(url) {
+  const m = String(url || '').match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+  if (!m) return null;
+  return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+}
+
+function addressNumber(address) {
+  const m = String(address || '').match(/\b(\d{1,4})\b/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Build a stable single-place Maps deep link from the PLACE URL only.
+ * Never scan full page HTML — it contains other nearby !1s0x… ids.
+ */
+function buildMapsDeepLink(pageUrl) {
+  const href = String(pageUrl || '');
+  if (!href.includes('/maps/place/') && !/[?&]cid=/.test(href) && !/place_id=/i.test(href)) {
+    return { pid: null, mu: null };
+  }
+
+  // 1) !1s0x…:0x… in the place URL → cid=
+  const feat = href.match(/!1s(0x[0-9a-f]+):(0x[0-9a-f]+)/i);
   if (feat) {
     try {
       const cid = BigInt(feat[2]).toString();
-      return {
-        pid: `cid:${cid}`,
-        mu: `https://www.google.com/maps?cid=${cid}`
-      };
+      return { pid: `cid:${cid}`, mu: `https://www.google.com/maps?cid=${cid}` };
     } catch {}
   }
 
-  // 2) Explicit place_id= / query_place_id=
+  // 2) place_id / query_place_id in URL
   const qid = href.match(/[?&](?:query_)?place_id=(ChIJ[a-zA-Z0-9_-]{20,40})/i);
   if (qid) {
     return {
@@ -229,22 +254,10 @@ function buildMapsDeepLink(pageUrl, html) {
     };
   }
 
-  // 3) Strict ChIJ token only (avoid greedy HTML matches gluing ids together)
-  const chij = blob.match(/\b(ChIJ[a-zA-Z0-9_-]{23,35})\b/);
-  if (chij) {
-    return {
-      pid: chij[1],
-      mu: `https://www.google.com/maps/search/?api=1&query=station&query_place_id=${chij[1]}`
-    };
-  }
-
-  // 4) ludocid / cid= already in URL
-  const cidParam = href.match(/[?&]cid=(\d{6,})/i) || blob.match(/ludocid[=:](\d{6,})/i);
+  // 3) cid= already in URL
+  const cidParam = href.match(/[?&]cid=(\d{6,})/i);
   if (cidParam) {
-    return {
-      pid: `cid:${cidParam[1]}`,
-      mu: `https://www.google.com/maps?cid=${cidParam[1]}`
-    };
+    return { pid: `cid:${cidParam[1]}`, mu: `https://www.google.com/maps?cid=${cidParam[1]}` };
   }
 
   return { pid: null, mu: null };
@@ -265,19 +278,19 @@ function titleMatchesStation(title, station, subtitle = '') {
   const nameHits = nameToks.filter((t) => have.has(t)).length;
   const addrHits = addrToks.filter((t) => have.has(t)).length;
   const brandHits = brandToks.filter((t) => have.has(t)).length;
+  const num = addressNumber(address);
+  const numHit = num && `${title} ${subtitle}`.includes(num);
 
-  // Owner trade name (ARGYOIL EE)
+  // Strong: owner trade name
   if (nameHits >= 1 && nameToks.length <= 2) return true;
   if (nameHits >= 2) return true;
 
-  // Maps often titles the pin as brand only ("Aegean"); street lives in the address row
-  if (brandHits >= 1 && addrHits >= 1) return true;
-  if (brandHits >= 1 && nameHits >= 1) return true;
+  // Brand-only Maps titles (Aegean) need street number or 2+ address tokens
+  if (brandHits >= 1 && numHit) return true;
+  if (brandHits >= 1 && addrHits >= 2) return true;
+  if (brandHits >= 1 && nameHits >= 1 && addrHits >= 1) return true;
 
-  const want = [...nameToks, ...addrToks, ...brandToks];
-  let hits = 0;
-  for (const t of want) if (have.has(t)) hits++;
-  return hits / Math.max(want.length, 1) >= 0.25;
+  return false;
 }
 
 /**
@@ -344,44 +357,51 @@ async function fetchGoogleReviews(page, station, state) {
         .catch(() => {});
 
       if (!page.url().includes('/place/')) {
-        // Prefer a result card whose title overlaps the station name — never blind-click #1
-        const targetName = [name, brand].filter(Boolean).join(' ');
-        const clicked = await page.evaluate((wantName) => {
-          const cards = Array.from(
-            document.querySelectorAll('div.Nv2PK a.hfpxzc, [role="feed"] a.hfpxzc')
-          );
-          const norm = (s) =>
-            String(s || '')
-              .toLowerCase()
-              .normalize('NFD')
-              .replace(/[\u0300-\u036f]/g, '');
-          const want = norm(wantName)
-            .split(/[^a-z0-9\u0370-\u03ff]+/i)
-            .filter((t) => t.length > 2);
-          const score = (label) => {
-            const have = new Set(
-              norm(label)
-                .split(/[^a-z0-9\u0370-\u03ff]+/i)
-                .filter((t) => t.length > 2)
+        // Prefer a result card whose title overlaps name/brand/address — never blind-click #1
+        const targetName = [name, brand, address].filter(Boolean).join(' ');
+        const streetNum = addressNumber(address);
+        const clicked = await page.evaluate(
+          ({ wantName, streetNum: num }) => {
+            const cards = Array.from(
+              document.querySelectorAll('div.Nv2PK a.hfpxzc, [role="feed"] a.hfpxzc')
             );
-            return want.filter((t) => have.has(t)).length;
-          };
-          let best = null;
-          let bestScore = 0;
-          for (const a of cards) {
-            const label = a.getAttribute('aria-label') || a.textContent || '';
-            const s = score(label);
-            if (s > bestScore) {
-              bestScore = s;
-              best = a;
+            const norm = (s) =>
+              String(s || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '');
+            const want = norm(wantName)
+              .split(/[^a-z0-9\u0370-\u03ff]+/i)
+              .filter((t) => t.length > 2);
+            const score = (label) => {
+              const nlabel = norm(label);
+              const have = new Set(
+                nlabel
+                  .split(/[^a-z0-9\u0370-\u03ff]+/i)
+                  .filter((t) => t.length > 2)
+              );
+              let s = want.filter((t) => have.has(t)).length;
+              if (num && label.includes(num)) s += 3;
+              return s;
+            };
+            let best = null;
+            let bestScore = 0;
+            for (const a of cards) {
+              const label = a.getAttribute('aria-label') || a.textContent || '';
+              const s = score(label);
+              if (s > bestScore) {
+                bestScore = s;
+                best = a;
+              }
             }
-          }
-          if (best && bestScore > 0) {
-            best.click();
-            return true;
-          }
-          return false;
-        }, targetName);
+            if (best && bestScore > 0) {
+              best.click();
+              return true;
+            }
+            return false;
+          },
+          { wantName: targetName, streetNum }
+        );
 
         if (clicked) {
           await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2200 }).catch(() => {});
@@ -400,30 +420,31 @@ async function fetchGoogleReviews(page, station, state) {
         try {
           await page
             .waitForFunction(
-              () => /\/maps\/place\//.test(location.href) || /!1s0x/i.test(location.href),
+              () => /\/maps\/place\//.test(location.href) && /!1s0x/i.test(location.href),
               null,
-              { timeout: 3500 }
+              { timeout: 4000 }
             )
             .catch(() => {});
-          await page.waitForTimeout(400);
+          await page.waitForTimeout(500);
         } catch {}
 
-        let placeId = null;
-        let mapsUrl = null;
-        try {
-          const meta = await page.evaluate(() => {
-            const can = document.querySelector('link[rel="canonical"]')?.href || '';
-            return {
-              href: can || location.href || '',
-              html: document.documentElement.innerHTML.slice(0, 280000)
-            };
-          });
-          const link = buildMapsDeepLink(meta.href || page.url(), meta.html);
-          placeId = link.pid;
-          mapsUrl = link.mu;
-        } catch {}
+        const pageHref = page.url();
+        // Reject wrong nearby pin: Maps @lat,lng must be near the fuelgr station
+        if (!isNaN(lat) && !isNaN(lng)) {
+          const pin = coordsFromMapsUrl(pageHref);
+          if (pin) {
+            const dist = haversineM(lat, lng, pin.lat, pin.lng);
+            if (dist > 175) {
+              // Title matched a neighbour — try next query
+              if (qi < 2) await jitter(400, 900);
+              continue;
+            }
+          }
+        }
 
-        return { ...result, placeId, mapsUrl };
+        // ONLY parse the place URL — never page HTML (other cids live in the sidebar)
+        const link = buildMapsDeepLink(pageHref);
+        return { ...result, placeId: link.pid, mapsUrl: link.mu };
       }
       if (qi < 2) await jitter(400, 900);
     }
