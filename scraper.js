@@ -48,7 +48,7 @@ const ENRICH_FUELS = [2, 4, 5, 6]; // u100, diesel, heating, lpg
 /** Rotating web device id — refreshed on empty streaks / periodically. */
 let sessionDeviceId = 'web.' + crypto.randomUUID();
 let requestsSinceDeviceRotate = 0;
-const DEVICE_ROTATE_EVERY = 75;
+const DEVICE_ROTATE_EVERY = 100;
 
 const FETCH_STATS = {
   ok: 0,
@@ -97,10 +97,6 @@ function buildLocalStoragePayload(lat, lng, fuelType) {
 
 function looksLikeStationXml(xml) {
   return typeof xml === 'string' && (xml.includes('<gss') || xml.includes('<?xml') || xml.includes('<gs '));
-}
-
-function countGs(xml) {
-  return (xml.match(/<gs id="/g) || []).length;
 }
 
 /**
@@ -324,11 +320,10 @@ async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
       continue;
     }
 
-    const gs = countGs(xml);
-    if (gs === 0) {
+    // Valid XML with 0 stations = real empty cell (sea / no coverage). Do not retry.
+    if (!xml.includes('<gs id=')) {
       FETCH_STATS.emptyStations++;
-      // Throttle signal: valid envelope, no stations for a land point
-      continue;
+      return '';
     }
 
     FETCH_STATS.ok++;
@@ -473,6 +468,20 @@ async function processGridConcurrently(grid, concurrency = 5, label = 'Scan') {
   let completed = 0;
   let cursor = 0;
   let emptyStreak = 0;
+  // Serialize rotate+backoff so workers don't stack 2.5–4s sleeps together
+  let backoffChain = Promise.resolve();
+
+  function onEmptyResult() {
+    emptyStreak++;
+    if (emptyStreak % 25 !== 0) return Promise.resolve();
+    const streak = emptyStreak;
+    const job = backoffChain.then(async () => {
+      rotateDeviceId(`empty streak ${streak}`);
+      await sleep(2500 + Math.floor(Math.random() * 1500));
+    });
+    backoffChain = job.catch(() => {});
+    return job;
+  }
 
   async function worker() {
     while (cursor < grid.length) {
@@ -481,13 +490,15 @@ async function processGridConcurrently(grid, concurrency = 5, label = 'Scan') {
       let added = 0;
       try {
         const xml = await fetchCoordinates(point.lat, point.lng, point.fuelType);
-        const list = parseXmlStations(xml);
-        for (const s of list) {
-          if (!uniqueStations.has(s.id)) {
-            uniqueStations.set(s.id, s);
-            added++;
-          } else {
-            uniqueStations.set(s.id, mergeStation(uniqueStations.get(s.id), s));
+        if (xml) {
+          const list = parseXmlStations(xml);
+          for (const s of list) {
+            if (!uniqueStations.has(s.id)) {
+              uniqueStations.set(s.id, s);
+              added++;
+            } else {
+              uniqueStations.set(s.id, mergeStation(uniqueStations.get(s.id), s));
+            }
           }
         }
       } catch {
@@ -495,16 +506,15 @@ async function processGridConcurrently(grid, concurrency = 5, label = 'Scan') {
       }
 
       if (added === 0) {
-        emptyStreak++;
-        if (emptyStreak > 0 && emptyStreak % 25 === 0) {
-          rotateDeviceId(`empty streak ${emptyStreak}`);
-          await sleep(2500 + Math.floor(Math.random() * 1500));
-        }
+        await onEmptyResult();
+        // Polite pause after empties (sea cells / throttle)
+        await sleep(40 + Math.floor(Math.random() * 60));
       } else {
         emptyStreak = 0;
+        // Healthy hit — minimal pause
+        await sleep(Math.floor(Math.random() * 35));
       }
 
-      await sleep(60 + Math.floor(Math.random() * 80));
       completed++;
       if (completed % 25 === 0 || completed === grid.length) {
         process.stdout.write(

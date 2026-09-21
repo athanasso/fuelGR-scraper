@@ -10,6 +10,7 @@
  *  - Supports both raw schema (name, brand, address) and compact schema (n, b, a)
  *  - Dual-mode extraction: direct place detail (div.F7nice) + search results feed (div.Nv2PK)
  *  - Isolation: cleans page between queries to prevent SPA state bleed
+ *  - Fast path: no about:blank hop; blocks images/media/fonts; consent once
  *  - Dynamic wait: uses selector-based waiting instead of heavy fixed timeouts
  *  - Time budget: stops cleanly before GitHub Actions job timeouts (e.g. 150m)
  *  - Anti-bot safety: human jitter delays, CAPTCHA detection, single browser context
@@ -227,7 +228,7 @@ function titleMatchesStation(title, station, subtitle = '') {
  * Extracts rating and review count from a Google Maps business page.
  * Returns { rating: number|null, reviews: number|null, blocked?: boolean }.
  */
-async function fetchGoogleReviews(page, station) {
+async function fetchGoogleReviews(page, station, state) {
   const brandRaw = (station.brand || station.b || '').trim();
   const name = (station.name || station.n || '').trim();
   const address = (station.address || station.a || '').trim();
@@ -258,10 +259,10 @@ async function fetchGoogleReviews(page, station) {
   pushQ([name, address, mun, 'Greece']);
 
   try {
-    for (let qi = 0; qi < Math.min(queries.length, 5); qi++) {
+    // Cap at 3 — best queries are first; extras rarely help and burn time/CAPTCHA budget
+    for (let qi = 0; qi < Math.min(queries.length, 3); qi++) {
       const url = `https://www.google.com/maps/search/${encodeURIComponent(queries[qi])}`;
 
-      await page.goto('about:blank');
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
       if (page.url().includes('google.com/sorry') || page.url().includes('captcha')) {
@@ -269,18 +270,21 @@ async function fetchGoogleReviews(page, station) {
         return { rating: null, reviews: null, blocked: true };
       }
 
-      try {
-        const consentBtn = await page.$(
-          'button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button'
-        );
-        if (consentBtn) {
-          await consentBtn.click();
-          await page.waitForTimeout(1000);
-        }
-      } catch {}
+      if (!state.consentDone) {
+        try {
+          const consentBtn = await page.$(
+            'button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button'
+          );
+          if (consentBtn) {
+            await consentBtn.click();
+            await page.waitForTimeout(800);
+            state.consentDone = true;
+          }
+        } catch {}
+      }
 
       await page
-        .waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 3500 })
+        .waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 2800 })
         .catch(() => {});
 
       if (!page.url().includes('/place/')) {
@@ -324,7 +328,7 @@ async function fetchGoogleReviews(page, station) {
         }, targetName);
 
         if (clicked) {
-          await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2500 }).catch(() => {});
+          await page.waitForSelector('div.F7nice, div[role="main"]', { timeout: 2200 }).catch(() => {});
         }
       }
 
@@ -338,7 +342,7 @@ async function fetchGoogleReviews(page, station) {
       ) {
         return result;
       }
-      await jitter(800, 1500);
+      if (qi < 2) await jitter(400, 900);
     }
 
     return { rating: null, reviews: null };
@@ -356,6 +360,17 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
     viewport: { width: 1280, height: 800 }
   });
   const page = await context.newPage();
+
+  // Skip heavy assets — we only need DOM text for rating/count
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (type === 'image' || type === 'media' || type === 'font') {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
+  const state = { consentDone: false };
 
   while (true) {
     if (queue.length === 0) break;
@@ -375,7 +390,7 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
     process.stdout.write(`[${done.count + 1}] ${brand ? brand + ' ' : ''}${name} (${id})... `);
 
     const hadPrior = Boolean(results[id]);
-    const result = await fetchGoogleReviews(page, station);
+    const result = await fetchGoogleReviews(page, station, state);
     if (result.blocked) {
       queue.length = 0; // stop remaining requests gracefully
       break;
