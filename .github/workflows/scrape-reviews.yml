@@ -1,9 +1,9 @@
-name: Bi-Weekly Google Reviews Enrichment
+name: Twice-Daily Google Reviews Enrichment
 
 on:
   schedule:
-    # Runs at 03:00 UTC on the 1st and 15th of every month (every 2 weeks)
-    - cron: '0 3 1,15 * *'
+    # 05:00 & 17:00 EEST → 02:00 & 14:00 UTC (offset from price scraper)
+    - cron: '0 2,14 * * *'
   workflow_dispatch:
     inputs:
       delay_min:
