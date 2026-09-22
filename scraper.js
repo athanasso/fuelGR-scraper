@@ -63,6 +63,14 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Raw scrape uses latitude/longitude; compact CDN uses lat/lng — always accept both. */
+function stationCoords(s) {
+  const lat = Number(s?.lat ?? s?.latitude);
+  const lng = Number(s?.lng ?? s?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng };
+}
+
 function rotateDeviceId(reason) {
   sessionDeviceId = 'web.' + crypto.randomUUID();
   requestsSinceDeviceRotate = 0;
@@ -414,6 +422,8 @@ function parseXmlStations(xml) {
       lngNum <= 30.0;
 
     if (id && isValidCoord && Object.keys(fuels).length > 0) {
+      const latitude = Number(latNum.toFixed(6));
+      const longitude = Number(lngNum.toFixed(6));
       stations.push({
         id: String(id),
         name: ow.trim() || br.trim() || 'Πρατήριο Καυσίμων',
@@ -422,8 +432,11 @@ function parseXmlStations(xml) {
         prefecture: cnt.trim(),
         municipality: mun.trim(),
         district: dd.trim(),
-        latitude: Number(latNum.toFixed(6)),
-        longitude: Number(lngNum.toFixed(6)),
+        latitude,
+        longitude,
+        // Aliases so backfill / reviews never read the wrong field again
+        lat: latitude,
+        lng: longitude,
         fuel_type: primaryFuel,
         price: primaryPrice,
         fuels,
@@ -463,35 +476,40 @@ function mergeStation(existing, incoming) {
 /**
  * For stations missing standard fuels, POST at their exact lat/lng.
  * Nearby responses often fill several neighbours, so we skip already-filled.
+ * Throws if we somehow query nothing while many are missing (field-name bugs etc.).
  */
 async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
   for (const fuelId of fuelIds) {
     rotateDeviceId(`start ${label} fuel=${fuelId}`);
-    const pending = [...stationsMap.values()].filter((s) => !(s.fuels && s.fuels[String(fuelId)]));
+    const fuelKey = String(fuelId);
+    const pending = [...stationsMap.values()].filter((s) => !(s.fuels && s.fuels[fuelKey]));
     console.log(
       `Phase 3 ${label} fuel=${fuelId}: ${pending.length} stations missing (will skip as neighbours fill).`
     );
     let queried = 0;
     let gained = 0;
+    let skippedNoCoords = 0;
     for (let i = 0; i < pending.length; i++) {
       const s = pending[i];
       // Filled by an earlier nearby query
-      if (stationsMap.get(s.id)?.fuels?.[String(fuelId)]) continue;
+      if (stationsMap.get(s.id)?.fuels?.[fuelKey]) continue;
 
-      const lat = Number(s.lat);
-      const lng = Number(s.lng);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      const coords = stationCoords(s);
+      if (!coords) {
+        skippedNoCoords++;
+        continue;
+      }
 
       queried++;
       try {
-        const xml = await fetchCoordinates(lat, lng, fuelId, 2);
+        const xml = await fetchCoordinates(coords.lat, coords.lng, fuelId, 2);
         if (xml) {
           for (const hit of parseXmlStations(xml)) {
             if (!stationsMap.has(hit.id)) continue;
             const before = stationsMap.get(hit.id);
-            const had = Boolean(before.fuels && before.fuels[String(fuelId)]);
+            const had = Boolean(before.fuels && before.fuels[fuelKey]);
             stationsMap.set(hit.id, mergeStation(before, hit));
-            if (!had && stationsMap.get(hit.id).fuels?.[String(fuelId)]) gained++;
+            if (!had && stationsMap.get(hit.id).fuels?.[fuelKey]) gained++;
           }
         }
       } catch {
@@ -500,7 +518,7 @@ async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
 
       if (queried % 25 === 0 || i + 1 === pending.length) {
         const still = [...stationsMap.values()].filter(
-          (x) => !(x.fuels && x.fuels[String(fuelId)])
+          (x) => !(x.fuels && x.fuels[fuelKey])
         ).length;
         process.stdout.write(
           `\r[${label} f=${fuelId}] queried=${queried} gained=+${gained} stillMissing=${still}   `
@@ -509,6 +527,16 @@ async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
       await sleep(45 + Math.floor(Math.random() * 40));
     }
     if (pending.length) console.log('');
+
+    if (pending.length >= 50 && queried === 0) {
+      throw new Error(
+        `[${label}] fuel=${fuelId}: ${pending.length} stations missing but 0 queries ran` +
+          ` (skippedNoCoords=${skippedNoCoords}). Check stationCoords / lat fields.`
+      );
+    }
+    if (skippedNoCoords > 0) {
+      console.warn(`[${label}] fuel=${fuelId}: skipped ${skippedNoCoords} stations with no coords.`);
+    }
   }
 }
 
@@ -614,11 +642,22 @@ async function main() {
   }
 
   // Phase 3: enrich only hits urban/regional grids, so rural stations often miss
-  // diesel (and sometimes u95). Re-query exact coords for standard fuels.
+  // diesel/u100/lpg (and sometimes u95). Re-query exact coords for standard fuels.
   // One nearby hit can fill several neighbours — skip already-filled as we go.
-  await backfillMissingFuels(stationsMap, [1, 4], 'Backfill'); // u95 + diesel
+  await backfillMissingFuels(stationsMap, [1, 2, 4, 6], 'Backfill'); // u95 + u100 + diesel + lpg
 
   const stations = Array.from(stationsMap.values());
+  // Final coverage sanity — diesel should cover most of the network after backfill
+  const withDiesel = stations.filter((s) => s.fuels && s.fuels['4']).length;
+  const dieselPct = stations.length ? (100 * withDiesel) / stations.length : 0;
+  console.log(
+    `Coverage check: diesel ${withDiesel}/${stations.length} (${dieselPct.toFixed(1)}%).`
+  );
+  if (stations.length >= 2000 && dieselPct < 40) {
+    console.warn(
+      `[!] Diesel coverage suspiciously low (${dieselPct.toFixed(1)}%). Backfill may have under-delivered.`
+    );
+  }
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
   console.log(
     `Fetch stats: ok=${FETCH_STATS.ok} emptyBody=${FETCH_STATS.emptyBody} emptyStations=${FETCH_STATS.emptyStations} badDecode=${FETCH_STATS.badDecode} retried=${FETCH_STATS.retried} deviceRotates=${FETCH_STATS.deviceRotates}`

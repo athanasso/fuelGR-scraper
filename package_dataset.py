@@ -200,6 +200,43 @@ def append_today(ledger: dict[str, list[dict]], station_id: str, today: str, pri
     ledger[station_id] = records[-LEDGER_MAX_DAYS:]
 
 
+def fill_price_gaps_from_ledger(
+    prices: dict, records: list[dict], today: str, max_age_days: int = 7
+) -> dict:
+    """
+    If today's scrape missed a fuel (throttle / sparse enrich), keep a recent
+    ledger price so diesel/u100 don't flicker off for a day.
+    Never invent fuels the station never had.
+    """
+    if not records:
+        return prices
+    out = dict(prices)
+    try:
+        today_d = datetime.date.fromisoformat(today[:10])
+    except ValueError:
+        return out
+
+    for rec in reversed(records):
+        d = str(rec.get("date") or "")[:10]
+        if not d or d == today[:10]:
+            continue
+        try:
+            age = (today_d - datetime.date.fromisoformat(d)).days
+        except ValueError:
+            continue
+        if age < 0:
+            continue
+        if age > max_age_days:
+            break
+        for k in FUEL_KEYS:
+            if k in out:
+                continue
+            v = rec.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                out[k] = round(float(v), 3)
+    return out
+
+
 def sparkline_and_delta(records: list[dict], fuel_key: str, today_price: float):
     """Build real 14d sparkline + 7d delta from ledger; never invent prices."""
     series = []
@@ -252,6 +289,8 @@ def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]
         last_updated = raw.get("dt") or last_updated
 
     prices = extract_prices(raw)
+    # Don't drop diesel/u100 for one incomplete scrape — carry recent ledger gaps forward
+    prices = fill_price_gaps_from_ledger(prices, ledger.get(st_id, []), today, max_age_days=7)
     append_today(ledger, st_id, today, prices)
     records = ledger.get(st_id, [])
 

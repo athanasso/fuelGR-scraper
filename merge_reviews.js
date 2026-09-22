@@ -69,9 +69,18 @@ async function main() {
           if (!incoming || typeof incoming.rating !== 'number' || !(Number(incoming.reviews) > 0)) {
             continue; // never merge star-with-zero-reviews
           }
-          if (!merged[k] || (incoming.ts && (!merged[k].ts || incoming.ts > merged[k].ts))) {
-            merged[k] = incoming;
+          const prev = merged[k];
+          if (!prev || (incoming.ts && (!prev.ts || incoming.ts > prev.ts))) {
+            // Prefer newer rating, but never drop a prior Maps link if the new shard lacks one
+            const next = { ...incoming };
+            if (!next.mu && prev?.mu) next.mu = prev.mu;
+            if (!next.pid && prev?.pid) next.pid = prev.pid;
+            merged[k] = next;
             newEntries++;
+          } else if (prev && (!prev.mu && incoming.mu)) {
+            // Older shard somehow has a link baseline lacks — keep rating, take link
+            prev.mu = incoming.mu;
+            if (incoming.pid) prev.pid = incoming.pid;
           }
         }
         console.log(`Merged shard: ${file} (${keys.length} entries).`);

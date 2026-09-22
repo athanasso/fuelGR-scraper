@@ -606,10 +606,11 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
         reviews: result.reviews,
         ts: Math.floor(Date.now() / 1000)
       };
-      // Never inherit a prior Maps link — only keep what this pass confirmed
+      // Prefer freshly confirmed link; otherwise keep a prior good link (don't wipe on flaky extract)
       if (result.placeId) entry.pid = result.placeId;
+      else if (prior.pid) entry.pid = prior.pid;
       if (result.mapsUrl) entry.mu = result.mapsUrl;
-      else if (prior.mu && result.placeId === prior.pid) entry.mu = prior.mu;
+      else if (prior.mu) entry.mu = prior.mu;
       results[id] = entry;
       console.log(
         `${hadPrior ? '↻' : ''}★${result.rating} (${result.reviews})` +
