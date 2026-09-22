@@ -109,6 +109,8 @@ function hasValidMapsLink(entry) {
   const mu = String(entry.mu || '');
   if (/[?&]cid=\d{6,}/.test(mu)) return true;
   if (/query_place_id=ChIJ[a-zA-Z0-9_-]{20,40}/.test(mu)) return true;
+  // Matched place page URL (opens listing, not bare coordinates)
+  if (/google\.[^/]+\/maps\/place\//i.test(mu)) return true;
   const pid = String(entry.pid || '');
   if (/^cid:\d{6,}$/.test(pid)) return true;
   if (/^ChIJ[a-zA-Z0-9_-]{23,35}$/.test(pid)) return true;
@@ -251,8 +253,8 @@ function buildMapsDeepLink(pageUrl) {
     return { pid: null, mu: null };
   }
 
-  // 1) !1s0x…:0x… in the place URL → cid=
-  const feat = href.match(/!1s(0x[0-9a-f]+):(0x[0-9a-f]+)/i);
+  // 1) !1s0x…:0x… in the place URL → cid= (colon may be URL-encoded as %3A)
+  const feat = href.match(/!1s(0x[0-9a-f]+)(?::|%3[aA])(0x[0-9a-f]+)/i);
   if (feat) {
     try {
       const cid = BigInt(feat[2]).toString();
@@ -275,7 +277,42 @@ function buildMapsDeepLink(pageUrl) {
     return { pid: `cid:${cidParam[1]}`, mu: `https://www.google.com/maps?cid=${cidParam[1]}` };
   }
 
+  // 4) Fallback: matched /maps/place/… URL itself (opens the listing, not a bare pin).
+  //    Prefer this over lat/lng — the pin is often 1px off the real station marker.
+  if (href.includes('/maps/place/')) {
+    let mu = href.split('?')[0];
+    // Keep data=!… feature blob when present (has the place id); strip tracking
+    const dataIdx = href.indexOf('/data=');
+    if (dataIdx !== -1) {
+      const after = href.slice(dataIdx).split(/[?&](?=g_ep|entry|hl|authuser)=/)[0];
+      mu = href.slice(0, dataIdx) + after.split('?')[0];
+    }
+    if (mu.length > 512) mu = mu.slice(0, 512);
+    return { pid: null, mu };
+  }
+
   return { pid: null, mu: null };
+}
+
+/** Prefer URL bar, then og:url / canonical — still place-scoped, not sidebar HTML. */
+async function resolveMapsDeepLink(page) {
+  const candidates = [page.url()];
+  try {
+    const extras = await page.evaluate(() => {
+      const og = document.querySelector('meta[property="og:url"]')?.content || '';
+      const canon = document.querySelector('link[rel="canonical"]')?.href || '';
+      return [og, canon].filter(Boolean);
+    });
+    candidates.push(...extras);
+  } catch {}
+
+  let fallback = { pid: null, mu: null };
+  for (const u of candidates) {
+    const link = buildMapsDeepLink(u);
+    if (link.pid && link.mu) return link; // cid / place_id preferred
+    if (!fallback.mu && link.mu) fallback = link;
+  }
+  return fallback;
 }
 
 /** Reject shops/pharmacies that share «Σια ΕΕ» / street tokens with fuel stations. */
@@ -472,12 +509,18 @@ async function fetchGoogleReviews(page, station, state) {
         try {
           await page
             .waitForFunction(
-              () => /\/maps\/place\//.test(location.href) && /!1s0x/i.test(location.href),
+              () =>
+                /\/maps\/place\//.test(location.href) &&
+                (/!1s0x/i.test(location.href) || /place_id=/i.test(location.href)),
               null,
-              { timeout: 4000 }
+              { timeout: 7000 }
             )
             .catch(() => {});
-          await page.waitForTimeout(500);
+          // Even without !1s0x yet, /maps/place/… is enough for place-URL fallback
+          await page
+            .waitForFunction(() => /\/maps\/place\//.test(location.href), null, { timeout: 2000 })
+            .catch(() => {});
+          await page.waitForTimeout(400);
         } catch {}
 
         const pageHref = page.url();
@@ -494,8 +537,8 @@ async function fetchGoogleReviews(page, station, state) {
           }
         }
 
-        // ONLY parse the place URL — never page HTML (other cids live in the sidebar)
-        const link = buildMapsDeepLink(pageHref);
+        // Place URL / og:url only — never sidebar HTML (other cids live there)
+        const link = await resolveMapsDeepLink(page);
         if (!link.mu && !link.pid) {
           if (qi < 2) await jitter(400, 900);
           continue;
@@ -627,6 +670,7 @@ async function main() {
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
+  const missingLink = []; // has ★ but opens as bare coords in the app
   const missing = [];
   const stale = [];
   for (const s of stations) {
@@ -634,8 +678,9 @@ async function main() {
     const existing = results[id];
     if (!existing) {
       missing.push(s);
-    } else if (isStaleEntry(existing, nowSec) || !hasValidMapsLink(existing)) {
-      // Re-fetch stale ratings, and backfill Maps place links when missing/invalid
+    } else if (!hasValidMapsLink(existing)) {
+      missingLink.push(s);
+    } else if (isStaleEntry(existing, nowSec)) {
       stale.push(s);
     }
   }
@@ -648,6 +693,7 @@ async function main() {
   });
 
   missing.sort((a, b) => prefPriority(a) - prefPriority(b));
+  missingLink.sort((a, b) => prefPriority(a) - prefPriority(b));
 
   console.log(
     `${Object.keys(results).length} stations have reviews` +
@@ -656,11 +702,11 @@ async function main() {
         : REFRESH_DAYS > 0
           ? ` (refresh if older than ${REFRESH_DAYS}d)`
           : ' (refresh disabled)') +
-      `. Missing: ${missing.length}, stale: ${stale.length}.`
+      `. Missing rating: ${missing.length}, missing Maps link: ${missingLink.length}, stale: ${stale.length}.`
   );
 
-  // Fill gaps first, then refresh outdated ratings
-  let queue = [...missing, ...stale];
+  // Fix coord-fallback links first (user-visible), then gaps, then stale ratings
+  let queue = [...missingLink, ...missing, ...stale];
 
   // Stable id-based sharding so the same station always lands on the same runner
   if (TOTAL_SHARDS > 1) {
