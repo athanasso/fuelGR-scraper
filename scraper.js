@@ -561,6 +561,45 @@ async function main() {
     else stationsMap.set(id, mergeStation(stationsMap.get(id), s));
   }
 
+  // Phase 3: stations found only via diesel/LPG/u100 often miss Unleaded 95.
+  // Re-query their exact coords for fuel=1 (and any other missing common fuels).
+  rotateDeviceId('start u95 backfill');
+  const missingU95 = [];
+  for (const s of stationsMap.values()) {
+    if (!s.fuels || !s.fuels['1']) missingU95.push(s);
+  }
+  console.log(`Phase 3 u95 backfill: ${missingU95.length} stations missing Unleaded 95.`);
+  let backfilled = 0;
+  for (let i = 0; i < missingU95.length; i++) {
+    const s = missingU95[i];
+    const lat = Number(s.lat);
+    const lng = Number(s.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    try {
+      const xml = await fetchCoordinates(lat, lng, 1, 2);
+      if (!xml) continue;
+      const list = parseXmlStations(xml);
+      for (const hit of list) {
+        if (!stationsMap.has(hit.id)) continue;
+        const before = stationsMap.get(hit.id);
+        const had = Boolean(before.fuels && before.fuels['1']);
+        stationsMap.set(hit.id, mergeStation(before, hit));
+        if (!had && stationsMap.get(hit.id).fuels && stationsMap.get(hit.id).fuels['1']) {
+          backfilled++;
+        }
+      }
+    } catch {
+      // skip
+    }
+    if ((i + 1) % 25 === 0 || i + 1 === missingU95.length) {
+      process.stdout.write(
+        `\r[Backfill] ${i + 1}/${missingU95.length} -> +${backfilled} gained u95`
+      );
+    }
+    await sleep(50 + Math.floor(Math.random() * 40));
+  }
+  if (missingU95.length) console.log('');
+
   const stations = Array.from(stationsMap.values());
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
   console.log(

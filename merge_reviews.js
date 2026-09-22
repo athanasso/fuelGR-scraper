@@ -113,6 +113,20 @@ async function main() {
     console.log(`Cleared Maps links on ${dupLinks} stations sharing a duplicate cid (will re-scrape).`);
   }
 
+  // Known wrong businesses (plumbing shop etc.) — drop entire entry
+  const BAD_CIDS = new Set(['13564747657397881582']);
+  let badPurged = 0;
+  for (const [id, r] of Object.entries(merged)) {
+    const mu = String(r.mu || '');
+    const pid = String(r.pid || '');
+    const m = mu.match(/[?&]cid=(\d+)/) || pid.match(/^cid:(\d+)$/);
+    if (m && BAD_CIDS.has(m[1])) {
+      delete merged[id];
+      badPurged++;
+    }
+  }
+  if (badPurged > 0) console.log(`Purged ${badPurged} poisoned Maps cid entries.`);
+
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(merged), 'utf8');
   console.log(`\nSuccessfully merged ${shardCount} shards! Total stations with reviews: ${Object.keys(merged).length}.`);

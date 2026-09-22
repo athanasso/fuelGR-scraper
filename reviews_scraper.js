@@ -134,6 +134,7 @@ function extractRatingFromPage() {
   let reviews = null;
   let title = '';
   let subtitle = '';
+  let category = '';
 
   const heading = document.querySelector('div[role="main"] h1, h1.DUwDvf, h1');
   if (heading) title = (heading.textContent || '').trim();
@@ -146,6 +147,12 @@ function extractRatingFromPage() {
     const io = document.querySelector('div.Io6YTe');
     if (io) subtitle = (io.textContent || '').trim();
   }
+
+  // Category chip under the title (e.g. «Πρατήριο καυσίμων» / «Κατάστημα υδραυλικών ειδών»)
+  const catBtn = document.querySelector(
+    'div[role="main"] button[jsaction*="category"], div[role="main"] button.DkEaL'
+  );
+  if (catBtn) category = (catBtn.textContent || '').trim();
 
   const f7 = document.querySelector('div.F7nice');
   if (f7) {
@@ -191,16 +198,24 @@ function extractRatingFromPage() {
     }
   }
 
-  return { rating, reviews, title, subtitle };
+  return { rating, reviews, title, subtitle, category };
 }
 
-function tokens(s) {
+/** Legal-form / filler tokens that match almost any Greek ΕΕ listing (e.g. «Σια ΕΕ»). */
+const NAME_STOPWORDS = new Set([
+  'και', 'σια', 'κσι', 'αφοι', 'υιοι', 'υιος', 'οε', 'εε', 'αε', 'αβεε', 'αεε',
+  'ικε', 'εταιρεια', 'ετερεια', 'μονοπροσωπη', 'μονοιπροσωπη', 'μονοπρωσοπη',
+  'station', 'stations', 'fuels', 'fuel', 'gas', 'oil', 'petrol', 'πρατηριο',
+  'καυσιμων', 'καυσιμα', 'βενζιναδικο'
+]);
+
+function tokens(s, { keepStopwords = false } = {}) {
   return String(s || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .split(/[^a-z0-9\u0370-\u03ff]+/i)
-    .filter((t) => t.length > 2);
+    .filter((t) => t.length > 2 && (keepStopwords || !NAME_STOPWORDS.has(t)));
 }
 
 function haversineM(aLat, aLng, bLat, bLng) {
@@ -263,17 +278,33 @@ function buildMapsDeepLink(pageUrl) {
   return { pid: null, mu: null };
 }
 
-function titleMatchesStation(title, station, subtitle = '') {
+/** Reject shops/pharmacies that share «Σια ΕΕ» / street tokens with fuel stations. */
+function looksLikeFuelStation(title, subtitle = '', category = '') {
+  const blob = `${title} ${subtitle} ${category}`.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Hard reject non-fuel categories / titles
+  if (
+    /υδραυλικ|plumbing|φαρμακ|pharmacy|super\s*market|σουπερ\s*μαρκετ|cafe|καφετερια|εστιατορ|restaurant|ξενοδοχ|hotel|κομμωτ|φροντιστηρ|φουρνο|αρτοποι/i.test(
+      blob
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function titleMatchesStation(title, station, subtitle = '', category = '') {
   const name = station.name || station.n || '';
   const address = station.address || station.a || '';
   const brandRaw = station.brand || station.b || '';
   const { primary: brand } = normalizeBrand(brandRaw);
 
+  if (!looksLikeFuelStation(title, subtitle, category)) return false;
+
   const nameToks = tokens(name);
   const addrToks = tokens(address);
   const brandToks = tokens(brand);
-  const have = new Set(tokens(`${title} ${subtitle}`));
-  if (nameToks.length === 0 && addrToks.length === 0 && brandToks.length === 0) return true;
+  const have = new Set(tokens(`${title} ${subtitle}`, { keepStopwords: true }));
+  if (nameToks.length === 0 && addrToks.length === 0 && brandToks.length === 0) return false;
 
   const nameHits = nameToks.filter((t) => have.has(t)).length;
   const addrHits = addrToks.filter((t) => have.has(t)).length;
@@ -281,9 +312,9 @@ function titleMatchesStation(title, station, subtitle = '') {
   const num = addressNumber(address);
   const numHit = num && `${title} ${subtitle}`.includes(num);
 
-  // Strong: owner trade name
-  if (nameHits >= 1 && nameToks.length <= 2) return true;
+  // Distinctive trade name (stopwords already stripped — «Σια/και/ΕΕ» cannot fake a hit)
   if (nameHits >= 2) return true;
+  if (nameHits >= 1 && nameToks.length === 1 && (numHit || brandHits >= 1 || addrHits >= 1)) return true;
 
   // Brand-only Maps titles (Aegean) need street number or 2+ address tokens
   if (brandHits >= 1 && numHit) return true;
@@ -313,21 +344,21 @@ async function fetchGoogleReviews(page, station, state) {
   };
 
   // Prefer unique business identity over generic brand (avoids wrong nearby AEGEAN/SHELL)
-  if (name && address) pushQ([name, address]);
-  if (name && mun) pushQ([name, mun]);
-  if (name) pushQ([name]);
-  if (!isNaN(lat) && !isNaN(lng) && name) {
-    pushQ([name, address || mun, `${lat},${lng}`]);
+  if (name && address) pushQ([name, address, 'πρατήριο']);
+  if (brand && address) pushQ([brand, address, mun, 'πρατήριο καυσίμων']);
+  if (name && mun) pushQ([name, mun, 'πρατήριο']);
+  if (!isNaN(lat) && !isNaN(lng) && (name || brand)) {
+    pushQ([name || brand, address || mun, `${lat},${lng}`]);
   }
   // Brand + street — Maps often titles the pin as "Aegean" not "ARGYOIL EE"
-  if (brand && address) pushQ([brand, address, mun]);
   if (brand && address) pushQ([brand, address]);
   for (const b of brandAlts.slice(0, 2)) {
-    if (address) pushQ([b, address, mun || '']);
+    if (address) pushQ([b, address, mun || '', 'πρατήριο']);
   }
-  pushQ([name, address, mun, 'Greece']);
+  if (name) pushQ([name, 'πρατήριο καυσίμων']);
 
   try {
+    let sawWrongPlace = false;
     // Cap at 3 — best queries are first; extras rarely help and burn time/CAPTCHA budget
     for (let qi = 0; qi < Math.min(queries.length, 3); qi++) {
       const url = `https://www.google.com/maps/search/${encodeURIComponent(queries[qi])}`;
@@ -382,6 +413,11 @@ async function fetchGoogleReviews(page, station, state) {
               );
               let s = want.filter((t) => have.has(t)).length;
               if (num && label.includes(num)) s += 3;
+              // Prefer fuel-looking cards over random shops
+              if (/πρατηρ|καυσιμ|βενζιν|gas|fuel|petrol|shell|bp|eko|avin|aegean|αιγαιο/i.test(nlabel)) {
+                s += 4;
+              }
+              if (/υδραυλικ|plumbing|φαρμακ|cafe|καφε/i.test(nlabel)) s -= 5;
               return s;
             };
             let best = null;
@@ -409,12 +445,28 @@ async function fetchGoogleReviews(page, station, state) {
       }
 
       const result = await page.evaluate(extractRatingFromPage);
+      const matched = titleMatchesStation(
+        result.title || '',
+        station,
+        result.subtitle || '',
+        result.category || ''
+      );
+      // Clear non-fuel place (plumbing etc.) — try next query, flag for purge
+      if (
+        result.title &&
+        result.category &&
+        !looksLikeFuelStation(result.title, result.subtitle || '', result.category || '')
+      ) {
+        sawWrongPlace = true;
+        if (qi < 2) await jitter(400, 900);
+        continue;
+      }
       // Accept only when we have a real review count and the place title looks right
       if (
         result.rating !== null &&
         result.reviews !== null &&
         result.reviews > 0 &&
-        titleMatchesStation(result.title || '', station, result.subtitle || '')
+        matched
       ) {
         // Wait for Maps SPA to settle on the /place/ URL (needed for !1s0x…:0x… / cid)
         try {
@@ -444,12 +496,16 @@ async function fetchGoogleReviews(page, station, state) {
 
         // ONLY parse the place URL — never page HTML (other cids live in the sidebar)
         const link = buildMapsDeepLink(pageHref);
+        if (!link.mu && !link.pid) {
+          if (qi < 2) await jitter(400, 900);
+          continue;
+        }
         return { ...result, placeId: link.pid, mapsUrl: link.mu };
       }
       if (qi < 2) await jitter(400, 900);
     }
 
-    return { rating: null, reviews: null };
+    return { rating: null, reviews: null, wrongPlace: sawWrongPlace };
   } catch (err) {
     return { rating: null, reviews: null };
   }
@@ -507,15 +563,19 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
         reviews: result.reviews,
         ts: Math.floor(Date.now() / 1000)
       };
+      // Never inherit a prior Maps link — only keep what this pass confirmed
       if (result.placeId) entry.pid = result.placeId;
-      else if (prior.pid) entry.pid = prior.pid;
       if (result.mapsUrl) entry.mu = result.mapsUrl;
-      else if (prior.mu) entry.mu = prior.mu;
+      else if (prior.mu && result.placeId === prior.pid) entry.mu = prior.mu;
       results[id] = entry;
       console.log(
         `${hadPrior ? '↻' : ''}★${result.rating} (${result.reviews})` +
           (entry.mu || entry.pid ? ' 🔗' : '')
       );
+    } else if (result.wrongPlace && hadPrior) {
+      // Matched a plumbing shop / cafe etc. — drop poisoned rating + link
+      delete results[id];
+      console.log('n/a (purged wrong place)');
     } else {
       // Keep prior rating on failed refresh — don't wipe good data
       console.log(hadPrior ? 'n/a (kept prior)' : 'n/a');
@@ -550,8 +610,19 @@ async function main() {
       purged++;
     }
   }
+  // Known poisoned Maps cids (e.g. plumbing shop matched via «Σια ΕΕ»)
+  const BAD_CIDS = new Set(['13564747657397881582']);
+  for (const [id, r] of Object.entries(results)) {
+    const mu = String(r.mu || '');
+    const pid = String(r.pid || '');
+    const m = mu.match(/[?&]cid=(\d+)/) || pid.match(/^cid:(\d+)$/);
+    if (m && BAD_CIDS.has(m[1])) {
+      delete results[id];
+      purged++;
+    }
+  }
   if (purged > 0) {
-    console.log(`Purged ${purged} invalid review entries (missing/zero count).`);
+    console.log(`Purged ${purged} invalid/poisoned review entries.`);
     saveReviews(results);
   }
 
