@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: write
-  # Needed if a release tag is moved onto a commit that touches .github/workflows/*
-  workflows: write
 
 concurrency:
   group: fuelprices-updater
