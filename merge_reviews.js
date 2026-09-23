@@ -123,7 +123,10 @@ async function main() {
   }
 
   // Known wrong businesses (plumbing shop etc.) — drop entire entry
-  const BAD_CIDS = new Set(['13564747657397881582']);
+  const BAD_CIDS = new Set([
+    '13564747657397881582', // plumbing shop (Λαθουρη false match)
+    '18318450680674604743' // ARGY OIL duplicate; real pin is Aegean (with LPG)
+  ]);
   let badPurged = 0;
   for (const [id, r] of Object.entries(merged)) {
     const mu = String(r.mu || '');
