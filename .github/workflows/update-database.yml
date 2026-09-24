@@ -2,8 +2,10 @@ name: Twice-Daily Fuel Prices & Release Builder
 
 on:
   schedule:
-    # 08:00 & 18:00 EEST → 05:00 & 15:00 UTC
-    - cron: '0 5,15 * * *'
+    # Off-peak minutes avoid GitHub's top-of-hour queue drops (best-effort cron).
+    # 08:17 & 18:23 EEST → 05:17 & 15:23 UTC (summer UTC+3)
+    - cron: '17 5 * * *'
+    - cron: '23 15 * * *'
   workflow_dispatch:
 
 permissions:

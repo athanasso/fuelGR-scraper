@@ -2,8 +2,10 @@ name: Twice-Daily Google Reviews Enrichment
 
 on:
   schedule:
-    # 10:00 & 20:00 EEST → 07:00 & 17:00 UTC (after price scraper finishes)
-    - cron: '0 7,17 * * *'
+    # ~2h after prices; off-peak minutes (not :00) to reduce schedule drops.
+    # 10:19 & 20:27 EEST → 07:19 & 17:27 UTC (summer UTC+3)
+    - cron: '19 7 * * *'
+    - cron: '27 17 * * *'
   workflow_dispatch:
     inputs:
       delay_min:
