@@ -73,21 +73,21 @@ jobs:
             "dist/reviews.min.json.zst"
           )
 
-          # Point the date tag at this run via the Releases API (avoids
-          # `git push -f` being blocked when the commit touches workflow files).
+          # Keep the proven path: notes edit + asset upload.
+          # Do NOT pass --target on edit — GITHUB_TOKEN often gets
+          # HTTP 403 "Resource not accessible by integration" when
+          # retargeting an existing release tag (regression from the
+          # Sep 23 tag-push workaround).
           if gh release view "${TAG}" > /dev/null 2>&1; then
-            echo "Release ${TAG} already exists. Updating target, notes, and assets..."
+            echo "Release ${TAG} already exists. Updating notes and assets..."
             gh release edit "${TAG}" \
               --title "FuelGR Dataset ${TAG}" \
-              --notes-file dist/release_notes.md \
-              --target "${GITHUB_SHA}" \
-              --latest
+              --notes-file dist/release_notes.md
             gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           else
             echo "Creating new release ${TAG}..."
             gh release create "${TAG}" "${ASSETS[@]}" \
               --title "FuelGR Dataset ${TAG}" \
               --notes-file dist/release_notes.md \
-              --target "${GITHUB_SHA}" \
               --latest
           fi
