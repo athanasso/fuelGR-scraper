@@ -3,9 +3,10 @@ name: Twice-Daily Google Reviews Enrichment
 on:
   schedule:
     # ~2h after prices; off-peak minutes (not :00) to reduce schedule drops.
-    # 10:19 & 20:27 EEST → 07:19 & 17:27 UTC (summer UTC+3)
-    - cron: '19 7 * * *'
-    - cron: '27 17 * * *'
+    # Shifted earlier to offset typical GH schedule lag (~1h morning, ~3h evening).
+    # 09:19 & 17:27 EEST → 06:19 & 14:27 UTC (summer UTC+3)
+    - cron: '19 6 * * *'
+    - cron: '27 14 * * *'
   workflow_dispatch:
     inputs:
       delay_min:
