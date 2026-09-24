@@ -27,17 +27,17 @@ Mobile applications can consume the latest datasets directly via GitHub Release 
 
 The repository uses two separated GitHub Actions workflows for maximum reliability:
 
-### 1. Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
-Runs daily at **14:00 EEST (11:00 UTC)**:
+### 1. Twice-Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
+Runs daily at **08:17 & 18:23 EEST** (05:17 & 15:23 UTC in summer; off-peak minutes to reduce cron drops):
 - **`scraper.py`**: Fetches and parses government PDF bulletins for regional averages (Unleaded 95, 100, Diesel, LPG).
 - **`scraper.js`**: Queries 4,700+ stations nationwide via `fuelgr.gr/web/api/data.php` using mocked browser localStorage payload.
 - **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, and compresses with zstandard.
 - **GitHub Releases**: Publishes release tagged by date (e.g. `2026-09-17`) marked as `--latest`.
 
-### 2. Bi-Weekly Google Reviews Enrichment ([`scrape-reviews.yml`](.github/workflows/scrape-reviews.yml))
-Runs every 2 weeks on the **1st and 15th of each month at 03:00 UTC** (also triggerable via `workflow_dispatch`):
+### 2. Twice-Daily Google Reviews Enrichment ([`scrape-reviews.yml`](.github/workflows/scrape-reviews.yml))
+Runs daily at **10:19 & 20:27 EEST** (07:19 & 17:27 UTC in summer; ~2h after prices), also triggerable via `workflow_dispatch`:
 - **`reviews_scraper.js`**: Stealth Playwright automation querying Greek Google Maps for station ratings and review counts.
-- **Anti-Bot Protections**: Single browser context (`concurrency=1`), 6–12s randomized human delay, mouse scroll emulation, and automatic CAPTCHA backoff.
+- **Anti-Bot Protections**: Single browser context (`concurrency=1`), randomized human delay, mouse scroll emulation, and automatic CAPTCHA backoff.
 - **Urban Prioritization**: Queues Athens, Attica, Thessaloniki, and major prefectures first.
 - **Release Update**: Uploads updated `reviews.min.json` and `stations_latest.min.json` to the latest GitHub Release.
 
