@@ -2,12 +2,15 @@ name: Twice-Daily Fuel Prices & Release Builder
 
 on:
   schedule:
-    # Off-peak minutes avoid GitHub's top-of-hour queue drops (best-effort cron).
-    # Shifted earlier to offset typical GH schedule lag (~1h morning, ~3h evening).
-    # Target wall-clock ~08:xx / ~18:xx Athens after lag.
-    # 07:17 & 15:23 EEST → 04:17 & 12:23 UTC (summer UTC+3)
+    # GitHub cron is best-effort and often drops/delays morning jobs.
+    # Primary + backup slots (~90m later). cancel-in-progress is false so a
+    # late backup still publishes if the primary never started.
+    # Off-peak minutes (not :00) to reduce queue drops.
+    # Athens summer (UTC+3): 07:17 / 08:47 and 15:23 / 16:53
     - cron: '17 4 * * *'
+    - cron: '47 5 * * *'
     - cron: '23 12 * * *'
+    - cron: '53 13 * * *'
   workflow_dispatch:
 
 permissions:

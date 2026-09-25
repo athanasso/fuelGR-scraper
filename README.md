@@ -28,14 +28,14 @@ Mobile applications can consume the latest datasets directly via GitHub Release 
 The repository uses two separated GitHub Actions workflows for maximum reliability:
 
 ### 1. Twice-Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
-Runs daily at **07:17 & 15:23 EEST** (04:17 & 12:23 UTC in summer; cron set early to offset GitHub schedule lag toward ~08:xx / ~18:xx Athens):
+Scheduled **07:17 & 15:23 EEST** with backups **08:47 & 16:53** (GitHub cron often skips mornings; backups catch drops):
 - **`scraper.py`**: Fetches and parses government PDF bulletins for regional averages (Unleaded 95, 100, Diesel, LPG).
 - **`scraper.js`**: Queries 4,700+ stations nationwide via `fuelgr.gr/web/api/data.php` using mocked browser localStorage payload.
 - **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, and compresses with zstandard.
 - **GitHub Releases**: Publishes release tagged by date (e.g. `2026-09-17`) marked as `--latest`.
 
 ### 2. Twice-Daily Google Reviews Enrichment ([`scrape-reviews.yml`](.github/workflows/scrape-reviews.yml))
-Runs daily at **09:19 & 17:27 EEST** (06:19 & 14:27 UTC in summer; ~2h after prices), also triggerable via `workflow_dispatch`:
+Scheduled **09:19 & 17:27 EEST** with backups **10:49 & 18:57** (~2h after price primaries), also triggerable via `workflow_dispatch`:
 - **`reviews_scraper.js`**: Stealth Playwright automation querying Greek Google Maps for station ratings and review counts.
 - **Anti-Bot Protections**: Single browser context (`concurrency=1`), randomized human delay, mouse scroll emulation, and automatic CAPTCHA backoff.
 - **Urban Prioritization**: Queues Athens, Attica, Thessaloniki, and major prefectures first.
