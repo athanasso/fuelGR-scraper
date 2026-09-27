@@ -43,7 +43,7 @@ const MAX_PRICE = 5.0;
  * ~100 calls and we only cover ~20 locations (≈150 stations).
  */
 const DISCOVERY_FUEL = 1; // Unleaded 95
-const ENRICH_FUELS = [2, 4, 5, 6]; // u100, diesel, heating, lpg
+const ENRICH_FUELS = [2, 4, 5, 6, 8]; // u100, diesel, heating, lpg, cng
 
 /** Rotating web device id — refreshed on empty streaks / periodically. */
 let sessionDeviceId = 'web.' + crypto.randomUUID();
@@ -112,6 +112,40 @@ function looksLikeHtml(raw) {
   if (typeof raw !== 'string' || raw.length < 15) return false;
   const head = raw.trimStart().slice(0, 64).toLowerCase();
   return head.startsWith('<!doctype') || head.startsWith('<html') || raw.includes('<html');
+}
+
+/**
+ * fuelgr.gr has no separate diesel-premium fuel id — branded premiums
+ * (V-Power, Super Diesel, Crystal, …) are reported as type 4 with a product name.
+ */
+function isPremiumDieselName(name) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return false;
+  return (
+    /v-?\s*power\s*diesel/.test(n) ||
+    /super\s*diesel/.test(n) ||
+    /diesel\s*super/.test(n) ||
+    /ultimate\s*diesel/.test(n) ||
+    /diesel\s*premium/.test(n) ||
+    /premium\s*diesel/.test(n) ||
+    /\bcrystal\b/.test(n) ||
+    /diesel\s*best/.test(n) ||
+    /d-?\s*force/.test(n)
+  );
+}
+
+/**
+ * fuelgr.gr type 2 is "Αμόλυβδη 98/100" — split by product name into u98 / u100.
+ * @returns {'u98'|'u100'|'both'|'unknown'}
+ */
+function classifyHighOctaneName(name) {
+  const n = String(name || '');
+  const has98 = /\b98\b/.test(n);
+  const has100 = /\b100\b/.test(n);
+  if (has98 && !has100) return 'u98';
+  if (has100 && !has98) return 'u100';
+  if (has98 && has100) return 'both';
+  return 'unknown';
 }
 
 /**
@@ -422,6 +456,22 @@ function parseXmlStations(xml) {
         const pr = Number(rawPr.toFixed(3));
         fuels[ftId] = { name: ftName, price: pr, date: ftDt };
 
+        // Dual-key: keep regular diesel (4→d) and also expose branded premium as dp
+        if (ftId === '4' && isPremiumDieselName(ftName)) {
+          fuels.dp = { name: ftName, price: pr, date: ftDt };
+        }
+
+        // Type 2 is 98/100 combined — emit u98 / u100 by product name
+        if (ftId === '2') {
+          const octane = classifyHighOctaneName(ftName);
+          if (octane === 'u98' || octane === 'both') {
+            fuels.u98 = { name: ftName, price: pr, date: ftDt };
+          }
+          if (octane === 'u100' || octane === 'both' || octane === 'unknown') {
+            fuels.u100 = { name: ftName, price: pr, date: ftDt };
+          }
+        }
+
         if (!latestDate || ftDt > latestDate) latestDate = ftDt;
 
         if (ftId === '1' || ftName.includes('95')) {
@@ -667,6 +717,7 @@ async function main() {
 
   // Phase 3: enrich only hits urban/regional grids, so rural stations often miss
   // diesel/u100/lpg (and sometimes u95). Re-query exact coords for standard fuels.
+  // CNG is sparse (~dozens of stations) — covered by enrich grid only (no full backfill).
   // One nearby hit can fill several neighbours — skip already-filled as we go.
   await backfillMissingFuels(stationsMap, [1, 2, 4, 6], 'Backfill'); // u95 + u100 + diesel + lpg
 
@@ -687,7 +738,7 @@ async function main() {
     `Fetch stats: ok=${FETCH_STATS.ok} emptyBody=${FETCH_STATS.emptyBody} emptyStations=${FETCH_STATS.emptyStations} badDecode=${FETCH_STATS.badDecode} htmlBlock=${FETCH_STATS.htmlBlock} retried=${FETCH_STATS.retried} deviceRotates=${FETCH_STATS.deviceRotates}`
   );
 
-  const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg' };
+  const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg', 8: 'cng', u98: 'u98', u100: 'u100', dp: 'dp' };
   for (const fid of Object.keys(FUEL_LABELS)) {
     const prices = stations
       .map((s) => (s.fuels && s.fuels[fid] ? s.fuels[fid].price : null))
@@ -702,6 +753,8 @@ async function main() {
       );
     }
   }
+  const premiumDiesel = stations.filter((s) => s.fuels && s.fuels.dp).length;
+  console.log(`Diesel premium (classified by product name): ${premiumDiesel} stations.`);
 
   if (stations.length < 1000) {
     console.error(

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import shutil
 import subprocess
 import urllib.request
@@ -23,14 +24,43 @@ from pathlib import Path
 # Fuel type mapping to compact keys
 FUEL_KEY_MAP = {
     "1": "u95",   # Unleaded 95
-    "2": "u100",  # Unleaded 100
-    "4": "d",     # Diesel
+    # "2" (Αμόλυβδη 98/100) classified by product name → u98 / u100
+    "4": "d",     # Diesel (motion)
     "5": "dh",    # Heating Diesel
     "6": "lpg",   # LPG / Autogas
     "8": "cng",   # CNG
+    "u98": "u98", # Unleaded 98 (from type-2 product name)
+    "u100": "u100",
+    "dp": "dp",   # Diesel Premium (branded; classified from diesel product name)
 }
 
-FUEL_KEYS = ("u95", "u100", "d", "dh", "lpg", "cng")
+FUEL_KEYS = ("u95", "u98", "u100", "d", "dp", "dh", "lpg", "cng")
+
+# diesel product names that are premium / special quality (same API fuel id 4)
+_PREMIUM_DIESEL_RE = re.compile(
+    r"v-?\s*power\s*diesel|super\s*diesel|diesel\s*super|ultimate\s*diesel|"
+    r"diesel\s*premium|premium\s*diesel|\bcrystal\b|diesel\s*best|d-?\s*force",
+    re.IGNORECASE,
+)
+
+
+def is_premium_diesel_name(name: str) -> bool:
+    return bool(name and _PREMIUM_DIESEL_RE.search(str(name)))
+
+
+def classify_high_octane(name: str) -> list[str]:
+    """Split fuelgr type 2 (98/100) by product name."""
+    n = str(name or "")
+    has98 = bool(re.search(r"\b98\b", n))
+    has100 = bool(re.search(r"\b100\b", n))
+    if has98 and not has100:
+        return ["u98"]
+    if has100 and not has98:
+        return ["u100"]
+    if has98 and has100:
+        return ["u98", "u100"]
+    # Ambiguous — keep under u100 for backward compatibility with old clients
+    return ["u100"]
 LEDGER_MAX_DAYS = 365
 SPARKLINE_DAYS = 14
 RELEASE_LEDGER_URL = (
@@ -85,11 +115,26 @@ def extract_prices(raw: dict) -> dict:
     prices = {}
     raw_fuels = raw.get("fuels") or {}
     for fid, fobj in raw_fuels.items():
-        key = FUEL_KEY_MAP.get(str(fid))
-        if key and isinstance(fobj, dict):
-            pr = fobj.get("price")
-            if pr is not None and float(pr) > 0:
-                prices[key] = round(float(pr), 3)
+        if not isinstance(fobj, dict):
+            continue
+        pr = fobj.get("price")
+        if pr is None or float(pr) <= 0:
+            continue
+        pr = round(float(pr), 3)
+        fid_s = str(fid)
+
+        # Type 2 is combined 98/100 on fuelgr — split by product name
+        if fid_s == "2":
+            for k in classify_high_octane(fobj.get("name", "")):
+                prices[k] = pr
+            continue
+
+        key = FUEL_KEY_MAP.get(fid_s)
+        if key:
+            prices[key] = pr
+            # Fallback classification if scraper didn't emit fuels.dp yet
+            if key == "d" and "dp" not in prices and is_premium_diesel_name(fobj.get("name", "")):
+                prices["dp"] = pr
 
     # Already-compact master schema (from a previous release)
     if not prices and isinstance(raw.get("p"), dict):
@@ -105,6 +150,8 @@ def extract_prices(raw: dict) -> dict:
             prices["lpg"] = round(float(raw["price"]), 3)
         elif "100" in ft:
             prices["u100"] = round(float(raw["price"]), 3)
+        elif "98" in ft:
+            prices["u98"] = round(float(raw["price"]), 3)
         else:
             prices["u95"] = round(float(raw["price"]), 3)
 
@@ -352,7 +399,7 @@ def format_bytes(num_bytes: int) -> str:
 
 
 def count_fuel_coverage(master_stations: list) -> dict:
-    keys = ("u95", "u100", "d", "lpg", "dh", "cng")
+    keys = ("u95", "u98", "u100", "d", "dp", "lpg", "dh", "cng")
     counts = {k: 0 for k in keys}
     for s in master_stations:
         prices = s.get("p") or {}
@@ -494,9 +541,12 @@ Automated daily fuel prices dataset snapshot for Greece.
 - **Prefectures Tracked:** {pref_count}
 - **Gas Stations Tracked:** {station_count:,}
 - **Stations with Unleaded 95 (`u95`):** {fuel_counts['u95']:,}
+- **Stations with Unleaded 98 (`u98`):** {fuel_counts['u98']:,}
 - **Stations with Unleaded 100 (`u100`):** {fuel_counts['u100']:,}
 - **Stations with Diesel (`d`):** {fuel_counts['d']:,}
+- **Stations with Diesel Premium (`dp`):** {fuel_counts['dp']:,}
 - **Stations with LPG (`lpg`):** {fuel_counts['lpg']:,}
+- **Stations with CNG (`cng`):** {fuel_counts['cng']:,}
 - **Stations with Heating Diesel (`dh`):** {fuel_counts['dh']:,}
 - **Stations with Google Reviews:** {reviews_count:,}
 - **Schema:** Real daily price ledger → 7-day deltas (`d7`) and ledger-based sparklines (`sp`).
