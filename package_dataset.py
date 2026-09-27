@@ -129,12 +129,17 @@ def extract_prices(raw: dict) -> dict:
                 prices[k] = pr
             continue
 
+        # Type 4 diesel: premium product → dp only; regular → d only
+        if fid_s == "4":
+            if is_premium_diesel_name(fobj.get("name", "")):
+                prices["dp"] = pr
+            else:
+                prices["d"] = pr
+            continue
+
         key = FUEL_KEY_MAP.get(fid_s)
         if key:
             prices[key] = pr
-            # Fallback classification if scraper didn't emit fuels.dp yet
-            if key == "d" and "dp" not in prices and is_premium_diesel_name(fobj.get("name", "")):
-                prices["dp"] = pr
 
     # Already-compact master schema (from a previous release)
     if not prices and isinstance(raw.get("p"), dict):
@@ -154,6 +159,14 @@ def extract_prices(raw: dict) -> dict:
             prices["u98"] = round(float(raw["price"]), 3)
         else:
             prices["u95"] = round(float(raw["price"]), 3)
+
+    # Legacy dual-key bug: same type-4 price was written to both d and dp
+    if (
+        isinstance(prices.get("d"), (int, float))
+        and isinstance(prices.get("dp"), (int, float))
+        and abs(float(prices["d"]) - float(prices["dp"])) < 1e-6
+    ):
+        del prices["d"]
 
     return prices
 

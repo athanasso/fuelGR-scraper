@@ -454,11 +454,13 @@ function parseXmlStations(xml) {
 
       if (ftId && !isNaN(rawPr) && rawPr >= MIN_PRICE && rawPr <= MAX_PRICE) {
         const pr = Number(rawPr.toFixed(3));
-        fuels[ftId] = { name: ftName, price: pr, date: ftDt };
 
-        // Dual-key: keep regular diesel (4→d) and also expose branded premium as dp
+        // Diesel (4): premium product names are dp only — not also d
+        // (fuelgr returns one diesel price per station; dual-key made d===dp).
         if (ftId === '4' && isPremiumDieselName(ftName)) {
           fuels.dp = { name: ftName, price: pr, date: ftDt };
+        } else {
+          fuels[ftId] = { name: ftName, price: pr, date: ftDt };
         }
 
         // Type 2 is 98/100 combined — emit u98 / u100 by product name
