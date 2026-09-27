@@ -55,6 +55,7 @@ const FETCH_STATS = {
   emptyBody: 0,
   emptyStations: 0,
   badDecode: 0,
+  htmlBlock: 0,
   retried: 0,
   deviceRotates: 0
 };
@@ -105,6 +106,12 @@ function buildLocalStoragePayload(lat, lng, fuelType) {
 
 function looksLikeStationXml(xml) {
   return typeof xml === 'string' && (xml.includes('<gss') || xml.includes('<?xml') || xml.includes('<gs '));
+}
+
+function looksLikeHtml(raw) {
+  if (typeof raw !== 'string' || raw.length < 15) return false;
+  const head = raw.trimStart().slice(0, 64).toLowerCase();
+  return head.startsWith('<!doctype') || head.startsWith('<html') || raw.includes('<html');
 }
 
 /**
@@ -320,7 +327,14 @@ async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
     const xml = unscrambleResponse(raw);
     if (!looksLikeStationXml(xml)) {
       FETCH_STATS.badDecode++;
-      if (FETCH_STATS.badDecode <= 3) {
+      if (looksLikeHtml(raw)) {
+        FETCH_STATS.htmlBlock++;
+        if (FETCH_STATS.htmlBlock <= 3) {
+          console.warn(
+            `\n[warn] HTML block/challenge status=${status} rawLen=${raw.length} head=${raw.slice(0, 64).replace(/\s+/g, ' ')}`
+          );
+        }
+      } else if (FETCH_STATS.badDecode <= 3) {
         console.warn(
           `\n[warn] bad decode status=${status} rawLen=${raw.length} mod3=${raw.length % 3} head=${raw.slice(0, 48)}`
         );
@@ -343,16 +357,25 @@ async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
 /** Fail fast if the API is blocked / returning unusable bodies. */
 async function preflightProbe() {
   console.log('Preflight probe (Athens Unleaded 95)...');
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  // HTML/IP blocks are often transient on GH Actions — wait longer between tries.
+  const backoffsMs = [5_000, 15_000, 45_000, 90_000, 120_000];
+  for (let attempt = 1; attempt <= backoffsMs.length; attempt++) {
+    const beforeHtml = FETCH_STATS.htmlBlock || 0;
     const xml = await fetchCoordinates(37.9838, 23.7275, 1, 2);
     const n = parseXmlStations(xml).length;
     if (n > 0) {
       console.log(`Preflight OK: ${n} stations near Athens.`);
       return true;
     }
-    console.warn(`Preflight attempt ${attempt}/5 failed; backing off...`);
+    const htmlHits = (FETCH_STATS.htmlBlock || 0) - beforeHtml;
+    const wait = backoffsMs[attempt - 1];
+    console.warn(
+      `Preflight attempt ${attempt}/${backoffsMs.length} failed` +
+        (htmlHits > 0 ? ' (HTML block from fuelgr.gr)' : '') +
+        `; backing off ${Math.round(wait / 1000)}s...`
+    );
     rotateDeviceId('preflight miss');
-    await sleep(2000 * attempt);
+    await sleep(wait);
   }
   return false;
 }
@@ -620,7 +643,8 @@ async function main() {
   const probeOk = await preflightProbe();
   if (!probeOk) {
     console.error(
-      '[!] Preflight failed: fuelgr.gr/web/api/data.php returned no usable station XML. Likely IP throttle/block.'
+      '[!] Preflight failed: fuelgr.gr/web/api/data.php returned HTML/no station XML. ' +
+        'Likely datacenter IP throttle (common on GitHub Actions). Re-run later or use a non-GH IP.'
     );
     process.exit(1);
   }
@@ -660,7 +684,7 @@ async function main() {
   }
   console.log(`\nExtracted ${stations.length} valid unique gas stations.`);
   console.log(
-    `Fetch stats: ok=${FETCH_STATS.ok} emptyBody=${FETCH_STATS.emptyBody} emptyStations=${FETCH_STATS.emptyStations} badDecode=${FETCH_STATS.badDecode} retried=${FETCH_STATS.retried} deviceRotates=${FETCH_STATS.deviceRotates}`
+    `Fetch stats: ok=${FETCH_STATS.ok} emptyBody=${FETCH_STATS.emptyBody} emptyStations=${FETCH_STATS.emptyStations} badDecode=${FETCH_STATS.badDecode} htmlBlock=${FETCH_STATS.htmlBlock} retried=${FETCH_STATS.retried} deviceRotates=${FETCH_STATS.deviceRotates}`
   );
 
   const FUEL_LABELS = { 1: 'u95', 2: 'u100', 4: 'd', 5: 'dh', 6: 'lpg' };

@@ -50,8 +50,18 @@ jobs:
         run: python scraper.py
 
       - name: Run station-level fuel prices scraper
+        id: stations
+        continue-on-error: true
         run: node scraper.js
 
+      # fuelgr.gr often returns an HTML challenge to GitHub datacenter IPs;
+      # a cooldown + second try usually clears a transient throttle.
+      - name: Retry station scraper after cooldown
+        if: steps.stations.outcome == 'failure'
+        run: |
+          echo "First scrape failed (likely HTML/IP block). Waiting 5 minutes..."
+          sleep 300
+          node scraper.js
 
       - name: Package dataset and compress with zstd
         run: python package_dataset.py
