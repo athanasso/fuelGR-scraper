@@ -33,6 +33,34 @@ function Invoke-Gh {
   }
 }
 
+function Sync-ReviewsBaseline {
+  # Previous release tag — local publish must not shrink the reviews map.
+  $todayTag = (Get-Date).ToString('yyyy-MM-dd')
+  $tags = @(gh release list -L 20 --json tagName -q '.[].tagName' 2>$null)
+  $baselineTag = $tags | Where-Object { $_ -and $_ -ne $todayTag } | Select-Object -First 1
+  if (-not $baselineTag) {
+    Write-Host "==> No prior release for reviews baseline (first publish?)" -ForegroundColor Yellow
+    return
+  }
+  $dest = Join-Path 'data' 'reviews_baseline.min.json'
+  New-Item -ItemType Directory -Force -Path 'data' | Out-Null
+  Write-Host "==> Reviews baseline from release $baselineTag ..." -ForegroundColor Cyan
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  gh release download $baselineTag -p reviews.min.json -O $dest --clobber 1>$null 2>$null
+  $ErrorActionPreference = $prevEap
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dest)) {
+    Write-Host "==> Could not download reviews baseline (continuing without it)" -ForegroundColor Yellow
+  }
+}
+
+function Invoke-PackageDataset {
+  Sync-ReviewsBaseline
+  Write-Host "==> Packaging dataset..." -ForegroundColor Cyan
+  python package_dataset.py
+  if ($LASTEXITCODE -ne 0) { throw "package_dataset.py failed" }
+}
+
 Assert-Cmd gh
 
 Write-Host "==> Checking GitHub auth..." -ForegroundColor Cyan
@@ -63,11 +91,11 @@ if (-not $UploadOnly) {
   node scraper.js
   if ($LASTEXITCODE -ne 0) { throw "scraper.js failed (Cloudflare/HTML block or network)" }
 
-  Write-Host "==> Packaging dataset..." -ForegroundColor Cyan
-  python package_dataset.py
-  if ($LASTEXITCODE -ne 0) { throw "package_dataset.py failed" }
+  Invoke-PackageDataset
 } else {
-  Write-Host "==> Upload-only: using existing dist/" -ForegroundColor Yellow
+  Write-Host "==> Repack dist from data/ (merge reviews + ledger, no scrape)" -ForegroundColor Yellow
+  Assert-Cmd python
+  Invoke-PackageDataset
 }
 
 $tagFile = Join-Path 'dist' 'tag.txt'

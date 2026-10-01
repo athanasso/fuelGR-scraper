@@ -70,6 +70,9 @@ RELEASE_LEDGER_URL = (
 RELEASE_STATIONS_URL = (
     "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json"
 )
+RELEASE_REVIEWS_URL = (
+    "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json"
+)
 
 
 def compress_zstd(source_path: Path, dest_path: Path):
@@ -308,6 +311,130 @@ def load_previous_ledger(data_dir: Path) -> dict[str, list[dict]]:
     return {}
 
 
+def is_valid_review(rec) -> bool:
+    return (
+        isinstance(rec, dict)
+        and isinstance(rec.get("rating"), (int, float))
+        and int(rec.get("reviews") or 0) > 0
+    )
+
+
+def merge_review_pair(prev: dict | None, incoming: dict | None) -> dict | None:
+    """Same rules as merge_reviews.js: prefer newer ts, never drop Maps links."""
+    if not is_valid_review(incoming):
+        return prev if is_valid_review(prev) else None
+    if not is_valid_review(prev):
+        return dict(incoming)
+
+    prev = dict(prev)
+    inc = dict(incoming)
+    in_ts = int(inc.get("ts") or 0)
+    prev_ts = int(prev.get("ts") or 0)
+
+    if in_ts >= prev_ts:
+        nxt = {**inc}
+        if not nxt.get("mu") and prev.get("mu"):
+            nxt["mu"] = prev["mu"]
+        if not nxt.get("pid") and prev.get("pid"):
+            nxt["pid"] = prev["pid"]
+        return nxt
+
+    if not prev.get("mu") and inc.get("mu"):
+        prev["mu"] = inc["mu"]
+    if not prev.get("pid") and inc.get("pid"):
+        prev["pid"] = inc["pid"]
+    return prev
+
+
+def dedupe_review_maps_links(reviews: dict[str, dict]) -> dict[str, dict]:
+    """Strip shared Google cid links (wrong neighbour match) — mirrors merge_reviews.js."""
+    by_cid: dict[str, list[str]] = {}
+    for sid, rec in reviews.items():
+        mu = str(rec.get("mu") or "")
+        pid = str(rec.get("pid") or "")
+        m = re.search(r"[?&]cid=(\d+)", mu) or re.search(r"^cid:(\d+)$", pid)
+        if not m:
+            continue
+        by_cid.setdefault(m.group(1), []).append(sid)
+
+    for ids in by_cid.values():
+        if len(ids) < 2:
+            continue
+        for sid in ids:
+            reviews[sid].pop("mu", None)
+            reviews[sid].pop("pid", None)
+    return reviews
+
+
+def merge_reviews_dicts(*sources: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for sid, rec in src.items():
+            if sid in ("updated", "stations"):
+                continue
+            merged = merge_review_pair(out.get(str(sid)), rec if isinstance(rec, dict) else None)
+            if merged:
+                out[str(sid)] = merged
+
+    out = {k: v for k, v in out.items() if is_valid_review(v)}
+    return dedupe_review_maps_links(out)
+
+
+def load_previous_reviews(data_dir: Path) -> dict[str, dict]:
+    """
+    Union reviews from baseline file, local data, and CDN release.
+
+    Local-only packaging used to overwrite a fuller release map (same class of bug
+    as truncated ledgers). Optional FUELGR_REVIEWS_URL for recovery.
+    """
+    candidates: list[tuple[str, dict]] = []
+
+    override = (os.environ.get("FUELGR_REVIEWS_URL") or "").strip()
+    if override:
+        remote = fetch_json(override)
+        if isinstance(remote, dict) and remote:
+            candidates.append(("override", remote))
+
+    baseline = data_dir / "reviews_baseline.min.json"
+    if baseline.exists():
+        try:
+            with open(baseline, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                candidates.append(("baseline", data))
+                print(f"  [OK] Loaded baseline reviews ({len(data)} stations).")
+        except Exception as e:
+            print(f"  [!] Baseline reviews unreadable: {e}")
+
+    local = data_dir / "reviews.min.json"
+    if local.exists():
+        try:
+            with open(local, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                candidates.append(("local", data))
+                print(f"  [OK] Loaded local reviews ({len(data)} stations).")
+        except Exception as e:
+            print(f"  [!] Local reviews unreadable: {e}")
+
+    remote = fetch_json(RELEASE_REVIEWS_URL)
+    if isinstance(remote, dict) and remote:
+        candidates.append(("cdn", remote))
+        print(f"  [OK] Loaded CDN reviews ({len(remote)} stations).")
+
+    if not candidates:
+        return {}
+
+    merged = merge_reviews_dicts(*(d for _, d in candidates))
+    print(
+        f"  [OK] Using merged reviews from {[n for n, _ in candidates]} "
+        f"({len(merged)} stations)."
+    )
+    return merged
+
+
 def append_today(ledger: dict[str, list[dict]], station_id: str, today: str, prices: dict):
     if not prices:
         return
@@ -525,23 +652,11 @@ def main():
         print(f"Transforming {len(raw_stations)} stations with real price history...")
         ledger = load_previous_ledger(data_dir)
 
-        # Load Google Reviews
-        reviews_data = {}
-        rev_file = data_dir / "reviews.min.json"
-        if rev_file.exists():
-            try:
-                with open(rev_file, "r", encoding="utf-8") as f_rev:
-                    reviews_data = json.load(f_rev)
-                print(f"  [OK] Loaded local reviews ({len(reviews_data)} stations).")
-            except Exception as e:
-                print(f"  [!] Local reviews unreadable: {e}")
-        if not reviews_data:
-            remote_rev = fetch_json("https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json")
-            if isinstance(remote_rev, dict):
-                reviews_data = remote_rev
-                print(f"  [OK] Loaded CDN reviews ({len(reviews_data)} stations).")
+        reviews_data = load_previous_reviews(data_dir)
 
         if reviews_data:
+            with open(data_dir / "reviews.min.json", "w", encoding="utf-8") as f_rev_local:
+                json.dump(reviews_data, f_rev_local, ensure_ascii=False, separators=(",", ":"))
             with open(dist_dir / "reviews.min.json", "w", encoding="utf-8") as f_rev_dist:
                 json.dump(reviews_data, f_rev_dist, ensure_ascii=False, separators=(",", ":"))
             compress_zstd(dist_dir / "reviews.min.json", dist_dir / "reviews.min.json.zst")
