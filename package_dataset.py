@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -218,15 +219,60 @@ def seed_ledger_from_stations(stations: list) -> dict[str, list[dict]]:
     return ledger
 
 
+def ledger_depth(ledger: dict[str, list[dict]]) -> int:
+    """Total day-rows — used to prefer a full release ledger over a truncated local one."""
+    return sum(len(v) for v in ledger.values()) if ledger else 0
+
+
+def merge_ledgers(*ledgers: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Union per-station histories by date (later sources overwrite same-day rows)."""
+    out: dict[str, list[dict]] = {}
+    for ledger in ledgers:
+        if not ledger:
+            continue
+        for sid, records in ledger.items():
+            by_date = {r["date"]: dict(r) for r in out.get(sid, []) if r.get("date")}
+            for rec in records:
+                d = rec.get("date")
+                if not d:
+                    continue
+                by_date[d] = dict(rec)
+            out[sid] = [by_date[d] for d in sorted(by_date.keys())][-LEDGER_MAX_DAYS:]
+    return out
+
+
 def load_previous_ledger(data_dir: Path) -> dict[str, list[dict]]:
+    """
+    Build the prior ledger from every available source.
+
+    Prefer depth (CDN release usually wins over a short local file from a failed
+    local publish). Optional override: FUELGR_LEDGER_URL.
+    """
+    candidates: list[tuple[str, dict[str, list[dict]]]] = []
+
+    override = (os.environ.get("FUELGR_LEDGER_URL") or "").strip()
+    if override:
+        remote = fetch_json(override)
+        if remote:
+            ledger = normalize_ledger(remote)
+            if ledger:
+                print(
+                    f"  [OK] Loaded override ledger ({len(ledger)} stations, "
+                    f"depth={ledger_depth(ledger)})."
+                )
+                candidates.append(("override", ledger))
+
     local = data_dir / "price_ledger.min.json"
     if local.exists():
         try:
             with open(local, "r", encoding="utf-8") as f:
                 ledger = normalize_ledger(json.load(f))
             if ledger:
-                print(f"  [OK] Loaded local ledger ({len(ledger)} stations).")
-                return ledger
+                print(
+                    f"  [OK] Loaded local ledger ({len(ledger)} stations, "
+                    f"depth={ledger_depth(ledger)})."
+                )
+                candidates.append(("local", ledger))
         except Exception as e:
             print(f"  [!] Local ledger unreadable: {e}")
 
@@ -234,8 +280,22 @@ def load_previous_ledger(data_dir: Path) -> dict[str, list[dict]]:
     if remote:
         ledger = normalize_ledger(remote)
         if ledger:
-            print(f"  [OK] Loaded CDN ledger ({len(ledger)} stations).")
-            return ledger
+            print(
+                f"  [OK] Loaded CDN ledger ({len(ledger)} stations, "
+                f"depth={ledger_depth(ledger)})."
+            )
+            candidates.append(("cdn", ledger))
+
+    if candidates:
+        # Merge all sources so a truncated local never erases CDN history.
+        # Sort by depth ascending so deeper histories win same-day conflicts last.
+        candidates.sort(key=lambda x: ledger_depth(x[1]))
+        merged = merge_ledgers(*(led for _, led in candidates))
+        print(
+            f"  [OK] Using merged ledger from {[n for n, _ in candidates]} "
+            f"({len(merged)} stations, depth={ledger_depth(merged)})."
+        )
+        return merged
 
     # First-run bootstrap: previous station prices become day-0 history
     prev_stations = fetch_json(RELEASE_STATIONS_URL)
@@ -244,7 +304,7 @@ def load_previous_ledger(data_dir: Path) -> dict[str, list[dict]]:
         print(f"  [OK] Bootstrapped ledger from previous stations ({len(ledger)} stations).")
         return ledger
 
-    print("  [!] No previous ledger found — starting fresh (history grows daily).")
+    print("  [!] No previous ledger found - starting fresh (history grows daily).")
     return {}
 
 
