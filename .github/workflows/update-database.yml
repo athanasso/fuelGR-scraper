@@ -46,6 +46,13 @@ jobs:
           pip install -r requirements.txt
           npm install
 
+      - name: Set up Cloudflare WARP
+        uses: fscarmen/warp-on-actions@v1.4
+        continue-on-error: true
+        with:
+          stack: dual
+          mode: wireguard
+
       - name: Run prefecture fuel prices scraper
         run: python scraper.py
 
@@ -58,10 +65,19 @@ jobs:
       # a cooldown + second try usually clears a transient throttle.
       - name: Retry station scraper after cooldown
         if: steps.stations.outcome == 'failure'
+        id: stations_retry
+        continue-on-error: true
         run: |
-          echo "First scrape failed (likely HTML/IP block). Waiting 5 minutes..."
-          sleep 300
+          echo "First scrape failed (likely HTML/IP block). Waiting 2 minutes..."
+          sleep 120
           node scraper.js
+
+      - name: Fallback to existing stations dataset if scrape blocked
+        if: steps.stations.outcome == 'failure' && steps.stations_retry.outcome == 'failure'
+        run: |
+          echo "::warning::Station scraper blocked on both attempts. Restoring previous release stations dataset..."
+          mkdir -p data
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/stations_latest.min.json" -o data/stations_latest.min.json || true
 
       - name: Package dataset and compress with zstd
         run: python package_dataset.py

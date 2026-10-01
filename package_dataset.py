@@ -513,7 +513,13 @@ def sparkline_and_delta(records: list[dict], fuel_key: str, today_price: float):
     return sp, d7
 
 
-def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]], reviews: dict[str, dict] | None = None):
+def build_master_and_history(
+    raw: dict,
+    today: str,
+    ledger: dict[str, list[dict]],
+    reviews: dict[str, dict] | None = None,
+    is_fallback: bool = False,
+):
     st_id = str(raw.get("id", "")).strip()
     name = str(raw.get("name", "")).strip()
     brand = str(raw.get("brand", "")).strip() or "Ανεξάρτητο"
@@ -538,7 +544,8 @@ def build_master_and_history(raw: dict, today: str, ledger: dict[str, list[dict]
     prices = extract_prices(raw)
     # Don't drop diesel/u100 for one incomplete scrape — carry recent ledger gaps forward
     prices = fill_price_gaps_from_ledger(prices, ledger.get(st_id, []), today, max_age_days=7)
-    append_today(ledger, st_id, today, prices)
+    if not is_fallback:
+        append_today(ledger, st_id, today, prices)
     records = ledger.get(st_id, [])
 
     sparklines = {}
@@ -645,11 +652,26 @@ def main():
     station_file = data_dir / "stations_latest.min.json"
     raw_stations = []
     master_stations = []
-    if station_file.exists():
+    is_fallback = False
+
+    if not station_file.exists() or station_file.stat().st_size == 0:
+        print(f"[!] Warning: {station_file} missing or empty. Fetching fallback from latest release CDN...")
+        remote_stations = fetch_json(RELEASE_STATIONS_URL)
+        if remote_stations:
+            with open(station_file, "w", encoding="utf-8") as f:
+                json.dump(remote_stations, f, ensure_ascii=False, separators=(",", ":"))
+            print(f"  [OK] Loaded fallback stations from CDN ({len(remote_stations)} stations).")
+            is_fallback = True
+
+    if station_file.exists() and station_file.stat().st_size > 0:
         with open(station_file, "r", encoding="utf-8") as f:
             raw_stations = json.load(f)
 
-        print(f"Transforming {len(raw_stations)} stations with real price history...")
+        if not is_fallback and raw_stations and isinstance(raw_stations[0], dict) and "n" in raw_stations[0] and "p" in raw_stations[0]:
+            print(f"  [i] Detected carried-forward compact station dataset ({len(raw_stations)} stations). Skipping ledger today append.")
+            is_fallback = True
+
+        print(f"Transforming {len(raw_stations)} stations with real price history (is_fallback={is_fallback})...")
         ledger = load_previous_ledger(data_dir)
 
         reviews_data = load_previous_reviews(data_dir)
@@ -662,7 +684,9 @@ def main():
             compress_zstd(dist_dir / "reviews.min.json", dist_dir / "reviews.min.json.zst")
 
         for raw in raw_stations:
-            master_item, detail_history = build_master_and_history(raw, today, ledger, reviews_data)
+            master_item, detail_history = build_master_and_history(
+                raw, today, ledger, reviews_data, is_fallback=is_fallback
+            )
             master_stations.append(master_item)
 
             hist_file = history_dir / f"{master_item['id']}.json"
@@ -720,12 +744,19 @@ def main():
         except Exception:
             reviews_count = 0
 
+    status_note = (
+        "- **Station Prices Status:** ⚠️ Carried forward from previous release (Cloudflare WAF blocked runner IP). Prefectures updated.\n"
+        if is_fallback
+        else "- **Station Prices Status:** Fresh nationwide scrape.\n"
+    )
+
     release_notes = f"""## FuelGR Daily Dataset Release [{tag}]
 
 Automated daily fuel prices dataset snapshot for Greece.
 
 ### Summary
 - **Release Date:** {today}
+{status_note.rstrip()}
 - **Prefectures Tracked:** {pref_count}
 - **Gas Stations Tracked:** {station_count:,}
 - **Stations with Unleaded 95 (`u95`):** {fuel_counts['u95']:,}
