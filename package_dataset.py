@@ -73,6 +73,9 @@ RELEASE_STATIONS_URL = (
 RELEASE_REVIEWS_URL = (
     "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/reviews.min.json"
 )
+RELEASE_CHARGERS_URL = (
+    "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/chargers_latest.min.json"
+)
 
 
 def compress_zstd(source_path: Path, dest_path: Path):
@@ -718,12 +721,37 @@ def main():
     else:
         print(f"[!] Warning: {station_file} not found.")
 
-    # 3. Write tag.txt
+    # 3. Process EV Chargers
+    charger_file = data_dir / "chargers_latest.min.json"
+    chargers_data = []
+    if not charger_file.exists() or charger_file.stat().st_size == 0:
+        print(f"[!] Warning: {charger_file} missing or empty. Fetching fallback from latest release CDN...")
+        remote_chargers = fetch_json(RELEASE_CHARGERS_URL)
+        if remote_chargers:
+            with open(charger_file, "w", encoding="utf-8") as f:
+                json.dump(remote_chargers, f, ensure_ascii=False, separators=(",", ":"))
+            chargers_data = remote_chargers
+    else:
+        with open(charger_file, "r", encoding="utf-8") as f:
+            chargers_data = json.load(f)
+
+    if chargers_data:
+        charger_min_file = dist_dir / "chargers_latest.min.json"
+        with open(charger_min_file, "w", encoding="utf-8") as f:
+            json.dump(chargers_data, f, ensure_ascii=False, separators=(",", ":"))
+        with open(dist_dir / "chargers_latest.json", "w", encoding="utf-8") as f:
+            json.dump(chargers_data, f, ensure_ascii=False, indent=2)
+        compress_zstd(charger_min_file, dist_dir / "chargers_latest.min.json.zst")
+        print(f"[OK] EV chargers dataset written ({charger_min_file.stat().st_size:,} bytes, {len(chargers_data):,} hubs).")
+    else:
+        print("[!] Warning: No EV chargers data available.")
+
+    # 4. Write tag.txt
     tag_file = dist_dir / "tag.txt"
     with open(tag_file, "w", encoding="utf-8") as f:
         f.write(tag)
 
-    # 4. Generate release_notes.md
+    # 5. Generate release_notes.md
     notes_file = dist_dir / "release_notes.md"
     station_count = len(master_stations) if master_stations else len(raw_stations)
     pref_count = len(pref_data)
@@ -743,6 +771,9 @@ def main():
                 reviews_count = len(json.load(f_rev_count))
         except Exception:
             reviews_count = 0
+
+    charger_count = len(chargers_data)
+    avail_chargers = sum(1 for c in chargers_data if c.get("statusSummary") == "available")
 
     status_note = (
         "- **Station Prices Status:** ⚠️ Carried forward from previous release (Cloudflare WAF blocked runner IP). Prefectures updated.\n"
@@ -768,6 +799,7 @@ Automated daily fuel prices dataset snapshot for Greece.
 - **Stations with CNG (`cng`):** {fuel_counts['cng']:,}
 - **Stations with Heating Diesel (`dh`):** {fuel_counts['dh']:,}
 - **Stations with Google Reviews:** {reviews_count:,}
+- **EV Charging Hubs Tracked:** {charger_count:,} ({avail_chargers:,} live available)
 - **Schema:** Real daily price ledger → 7-day deltas (`d7`) and ledger-based sparklines (`sp`).
 
 ### Direct Download Links
@@ -785,6 +817,9 @@ The following assets can be fetched directly by mobile clients via GitHub Releas
 | [`prefectures_latest.min.json`]({dl}/prefectures_latest.min.json) | JSON (Minified) | {asset_size("prefectures_latest.min.json")} | Prefecture regional price averages |
 | [`prefectures_latest.min.json.zst`]({dl}/prefectures_latest.min.json.zst) | Zstandard | {asset_size("prefectures_latest.min.json.zst")} | Compressed prefecture averages |
 | [`prefectures_latest.json`]({dl}/prefectures_latest.json) | JSON | {asset_size("prefectures_latest.json")} | Human-readable prefecture averages |
+| [`chargers_latest.min.json`]({dl}/chargers_latest.min.json) | JSON (Minified) | {asset_size("chargers_latest.min.json")} | Greek EV charging hubs ({charger_count:,} locations) with live OCPI status |
+| [`chargers_latest.min.json.zst`]({dl}/chargers_latest.min.json.zst) | Zstandard | {asset_size("chargers_latest.min.json.zst")} | High-compression EV chargers dataset |
+| [`chargers_latest.json`]({dl}/chargers_latest.json) | JSON | {asset_size("chargers_latest.json")} | Human-readable Greek EV charging dataset |
 
 *Generated automatically by [fuelGR-scraper](https://github.com/athanasso/fuelGR-scraper).*
 """

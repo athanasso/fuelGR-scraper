@@ -20,6 +20,8 @@ Mobile applications can consume the latest datasets directly via GitHub Release 
 | **Price Ledger (Zstandard)** | [`price_ledger.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/price_ledger.min.json.zst) | Zstandard | Compressed rolling price ledger (~44 KB) |
 | **Prefectures (Minified)** | [`prefectures_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json) | JSON | 51 Greek prefectures daily fuel averages |
 | **Prefectures (Zstandard)** | [`prefectures_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/prefectures_latest.min.json.zst) | Zstandard | High-compression regional averages (~1.4 KB) |
+| **EV Chargers (Minified)** | [`chargers_latest.min.json`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/chargers_latest.min.json) | JSON | 4,300+ Greek EV charging hubs with real-time OCPI status, connectors, tariffs, and operators |
+| **EV Chargers (Zstandard)** | [`chargers_latest.min.json.zst`](https://github.com/athanasso/fuelGR-scraper/releases/latest/download/chargers_latest.min.json.zst) | Zstandard | Compressed EV dataset (~195 KB) |
 
 ---
 
@@ -31,7 +33,8 @@ The repository uses two separated GitHub Actions workflows for maximum reliabili
 Scheduled **07:17 & 15:23 EEST** with backups **08:47 & 16:53** (GitHub cron often skips mornings; backups catch drops):
 - **`scraper.py`**: Fetches and parses government PDF bulletins for regional averages (Unleaded 95, 100, Diesel, LPG).
 - **`scraper.js`**: Queries 4,700+ stations nationwide via `fuelgr.gr/web/api/data.php` using mocked browser localStorage payload.
-- **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, and compresses with zstandard.
+- **`scraper_ev.py`**: Queries the official Greek Ministry of Infrastructure & Transport (Μ.Υ.Φ.Α.Η.) OCPI 2.2 National Access Point (IDRO) static and dynamic feeds for 4,300+ EV charging hubs nationwide.
+- **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, packages EV chargers, and compresses with zstandard.
 - **GitHub Releases**: Publishes release tagged by date (e.g. `2026-09-17`) marked as `--latest`.
 
 ### 2. Twice-Daily Google Reviews Enrichment ([`scrape-reviews.yml`](.github/workflows/scrape-reviews.yml))
@@ -64,6 +67,10 @@ python scraper.py
 
 # Run station price scraper
 npm run scrape
+
+# Run EV charging stations scraper (Greek Ministry OCPI feeds)
+npm run scrape:ev
+# or: python scraper_ev.py
 
 # Run Google Reviews scraper (slow stealth mode)
 npm run scrape:reviews

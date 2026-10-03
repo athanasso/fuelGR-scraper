@@ -8,7 +8,8 @@
     "scrape": "node scraper.js",
     "scrape:reviews": "node reviews_scraper.js",
     "publish:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1",
-    "publish:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -UploadOnly"
+    "publish:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -UploadOnly",
+    "scrape:ev": "python scraper_ev.py"
   },
   "dependencies": {
     "playwright": "^1.40.0"

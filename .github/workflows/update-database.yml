@@ -79,6 +79,18 @@ jobs:
           mkdir -p data
           curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/stations_latest.min.json" -o data/stations_latest.min.json || true
 
+      - name: Run EV charging stations scraper
+        id: ev_chargers
+        continue-on-error: true
+        run: python scraper_ev.py
+
+      - name: Fallback to existing EV chargers dataset if scrape blocked
+        if: steps.ev_chargers.outcome == 'failure'
+        run: |
+          echo "::warning::EV scraper blocked or unavailable. Restoring previous release chargers dataset..."
+          mkdir -p data
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/chargers_latest.min.json" -o data/chargers_latest.min.json || true
+
       - name: Package dataset and compress with zstd
         run: python package_dataset.py
 
@@ -100,6 +112,9 @@ jobs:
             "dist/prefectures_latest.json"
             "dist/reviews.min.json"
             "dist/reviews.min.json.zst"
+            "dist/chargers_latest.min.json"
+            "dist/chargers_latest.min.json.zst"
+            "dist/chargers_latest.json"
           )
 
           # Keep the proven path: notes edit + asset upload.

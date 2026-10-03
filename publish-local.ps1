@@ -13,6 +13,7 @@
 #>
 param(
   [switch]$SkipPrefectures,
+  [switch]$SkipEV,
   [switch]$UploadOnly
 )
 
@@ -91,6 +92,14 @@ if (-not $UploadOnly) {
   node scraper.js
   if ($LASTEXITCODE -ne 0) { throw "scraper.js failed (Cloudflare/HTML block or network)" }
 
+  if (-not $SkipEV) {
+    Write-Host "==> EV charging stations scraper (scraper_ev.py)..." -ForegroundColor Cyan
+    python scraper_ev.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "==> EV scraper non-fatal warning" -ForegroundColor Yellow }
+  } else {
+    Write-Host "==> Skipping EV scraper" -ForegroundColor Yellow
+  }
+
   Invoke-PackageDataset
 } else {
   Write-Host "==> Repack dist from data/ (merge reviews + ledger, no scrape)" -ForegroundColor Yellow
@@ -113,7 +122,10 @@ $assets = @(
   'dist/prefectures_latest.min.json.zst',
   'dist/prefectures_latest.json',
   'dist/reviews.min.json',
-  'dist/reviews.min.json.zst'
+  'dist/reviews.min.json.zst',
+  'dist/chargers_latest.min.json',
+  'dist/chargers_latest.min.json.zst',
+  'dist/chargers_latest.json'
 )
 
 foreach ($a in $assets) {
