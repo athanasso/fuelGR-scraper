@@ -1,0 +1,60 @@
+name: Frequent EV Charger Availability & Status Updater
+
+on:
+  schedule:
+    # Run every 2 hours at minute 20 (off-peak minute)
+    # Greek Ministry (electrokinisi.yme.gov.gr) updates dynamic feed continuously
+    - cron: '20 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fuelgr-chargers-updater
+  cancel-in-progress: false
+
+jobs:
+  update-chargers:
+    name: Scrape EV Feeds & Update Release Assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download latest stations dataset for location linking
+        continue-on-error: true
+        run: |
+          mkdir -p data dist
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/stations_latest.min.json" -o data/stations_latest.min.json || true
+
+      - name: Run EV charging stations scraper & normalizer
+        run: python scraper_ev.py
+
+      - name: Update GitHub Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release view --json tagName -q .tagName)
+          echo "Updating EV chargers on release ${TAG}..."
+          if [ -f "dist/chargers_latest.min.json" ]; then
+            gh release upload "${TAG}" \
+              "dist/chargers_latest.min.json" \
+              "dist/chargers_latest.min.json.zst" \
+              "dist/chargers_latest.json" \
+              --clobber
+          fi

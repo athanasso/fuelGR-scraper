@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -208,20 +210,36 @@ def get_default_tariff(op_key: str, current: str, power_kw: float) -> float:
 
 def load_gas_stations_for_linking(data_dir: Path) -> list[dict]:
     """Load fuel stations to cross-reference co-located EV chargers."""
-    fuel_file = data_dir / "stations_latest.min.json"
-    if fuel_file.exists():
-        try:
-            with open(fuel_file, "r", encoding="utf-8") as f:
-                stations = json.load(f)
-                valid = []
-                for s in stations:
-                    lat = s.get("lat")
-                    lng = s.get("lng")
-                    if lat and lng:
-                        valid.append({"id": s.get("id"), "lat": float(lat), "lng": float(lng)})
-                return valid
-        except Exception:
-            pass
+    candidate_paths = [
+        data_dir / "stations_latest.min.json",
+        DIST_DIR / "stations_latest.min.json",
+    ]
+    for fuel_file in candidate_paths:
+        if fuel_file.exists() and fuel_file.stat().st_size > 0:
+            try:
+                with open(fuel_file, "r", encoding="utf-8") as f:
+                    stations = json.load(f)
+                    valid = []
+                    for s in stations:
+                        lat = s.get("lat")
+                        lng = s.get("lng")
+                        if lat and lng:
+                            valid.append({"id": s.get("id"), "lat": float(lat), "lng": float(lng)})
+                    if valid:
+                        return valid
+            except Exception:
+                pass
+
+    # Try downloading from latest release if not cached locally
+    try:
+        release_url = "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json"
+        raw = download_with_retry(release_url, max_retries=1, timeout=10)
+        if raw:
+            stations = json.loads(raw.decode("utf-8"))
+            return [{"id": s.get("id"), "lat": float(s["lat"]), "lng": float(s["lng"])} for s in stations if s.get("lat") and s.get("lng")]
+    except Exception:
+        pass
+
     return []
 
 
@@ -415,35 +433,77 @@ def scrape_ev_chargers() -> list[dict]:
     return chargers
 
 
+def compress_zstd(source_path: Path, dest_path: Path):
+    """Compress file using python zstandard library or fallback to zstd CLI."""
+    try:
+        import zstandard as zstd
+
+        cctx = zstd.ZstdCompressor(level=19)
+        with open(source_path, "rb") as f_in, open(dest_path, "wb") as f_out:
+            cctx.copy_stream(f_in, f_out)
+        print(f"  [zstd-lib] Compressed {source_path.name} -> {dest_path.name} ({dest_path.stat().st_size:,} bytes)")
+        return
+    except ImportError:
+        pass
+
+    zstd_bin = shutil.which("zstd")
+    if zstd_bin:
+        res = subprocess.run(
+            [zstd_bin, "-19", "-f", str(source_path), "-o", str(dest_path)],
+            capture_output=True,
+        )
+        if res.returncode == 0:
+            print(f"  [zstd-cli] Compressed {source_path.name} -> {dest_path.name} ({dest_path.stat().st_size:,} bytes)")
+            return
+
+    print(f"  [!] Note: zstd not available to compress {dest_path.name}")
+
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    target_file = DATA_DIR / "chargers_latest.min.json"
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    target_data_file = DATA_DIR / "chargers_latest.min.json"
 
     chargers = scrape_ev_chargers()
 
     # Fallback to local or CDN release if live scrape failed
     if not chargers:
-        if target_file.exists() and target_file.stat().st_size > 0:
-            print(f"  [i] Using existing local {target_file.name} fallback.")
-            return
-
-        print("  [!] Scraping failed. Attempting to fetch previous release fallback from GitHub...")
-        fallback_bytes = download_with_retry(RELEASE_CHARGERS_URL, max_retries=2, timeout=20)
-        if fallback_bytes:
-            try:
-                chargers = json.loads(fallback_bytes.decode("utf-8"))
-                print(f"  [OK] Successfully restored {len(chargers)} chargers from GitHub Releases CDN.")
-            except Exception:
-                pass
+        if target_data_file.exists() and target_data_file.stat().st_size > 0:
+            print(f"  [i] Using existing local {target_data_file.name} fallback.")
+            with open(target_data_file, "r", encoding="utf-8") as f:
+                chargers = json.load(f)
+        else:
+            print("  [!] Scraping failed. Attempting to fetch previous release fallback from GitHub...")
+            fallback_bytes = download_with_retry(RELEASE_CHARGERS_URL, max_retries=2, timeout=20)
+            if fallback_bytes:
+                try:
+                    chargers = json.loads(fallback_bytes.decode("utf-8"))
+                    print(f"  [OK] Successfully restored {len(chargers)} chargers from GitHub Releases CDN.")
+                except Exception:
+                    pass
 
     if not chargers:
         print("  [!] Remote unavailable. Using curated Greek EV charging hubs fallback.")
         chargers = CURATED_FALLBACK
 
-    with open(target_file, "w", encoding="utf-8") as f:
+    # 1. Write data/chargers_latest.min.json
+    with open(target_data_file, "w", encoding="utf-8") as f:
         json.dump(chargers, f, ensure_ascii=False, separators=(",", ":"))
 
-    print(f"\n[OK] Successfully saved {len(chargers):,} Greek EV chargers to {target_file} ({target_file.stat().st_size:,} bytes).")
+    # 2. Write dist/chargers_latest.min.json
+    dist_min = DIST_DIR / "chargers_latest.min.json"
+    with open(dist_min, "w", encoding="utf-8") as f:
+        json.dump(chargers, f, ensure_ascii=False, separators=(",", ":"))
+
+    # 3. Write dist/chargers_latest.json
+    dist_json = DIST_DIR / "chargers_latest.json"
+    with open(dist_json, "w", encoding="utf-8") as f:
+        json.dump(chargers, f, ensure_ascii=False, indent=2)
+
+    # 4. Write dist/chargers_latest.min.json.zst
+    compress_zstd(dist_min, DIST_DIR / "chargers_latest.min.json.zst")
+
+    print(f"\n[OK] Successfully saved {len(chargers):,} Greek EV chargers to {target_data_file} and {DIST_DIR}.")
 
 
 if __name__ == "__main__":
