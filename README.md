@@ -27,7 +27,7 @@ Mobile applications can consume the latest datasets directly via GitHub Release 
 
 ## Automated Workflows
 
-The repository uses two separated GitHub Actions workflows for maximum reliability:
+The repository uses three automated GitHub Actions workflows for maximum reliability:
 
 ### 1. Twice-Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
 Scheduled **07:17 & 15:23 EEST** with backups **08:47 & 16:53** (GitHub cron often skips mornings; backups catch drops):
@@ -43,6 +43,12 @@ Scheduled **09:19 & 17:27 EEST** with backups **10:49 & 18:57** (~2h after price
 - **Anti-Bot Protections**: Single browser context (`concurrency=1`), randomized human delay, mouse scroll emulation, and automatic CAPTCHA backoff.
 - **Urban Prioritization**: Queues Athens, Attica, Thessaloniki, and major prefectures first.
 - **Release Update**: Uploads updated `reviews.min.json` and `stations_latest.min.json` to the latest GitHub Release.
+
+### 3. Bi-Hourly EV Charger Status Updater ([`update-chargers.yml`](.github/workflows/update-chargers.yml))
+Scheduled every 2 hours at :20 UTC (`20 */2 * * *`), also triggerable via `workflow_dispatch`:
+- **`scraper_ev.py`**: Queries the official Greek Ministry of Infrastructure & Transport (Μ.Υ.Φ.Α.Η. / OCPI 2.2 National Access Point) for real-time connector availability, tariffs, and EVSE status updates across all Greek CPO networks.
+- **Fast Packaging**: Regroups EV data into normalized schema, generates minified `chargers_latest.min.json`, and compresses with zstandard (`.zst`).
+- **In-Place Release Update**: Uploads refreshed charger datasets directly to the active `--latest` GitHub Release without waiting for or disrupting twice-daily fuel runs.
 
 ---
 
