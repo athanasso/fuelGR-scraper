@@ -2,9 +2,9 @@ name: Frequent EV Charger Availability & Status Updater
 
 on:
   schedule:
-    # Run every 2 hours at minute 20 (off-peak minute)
-    # Greek Ministry (electrokinisi.yme.gov.gr) updates dynamic feed continuously
-    - cron: '20 */2 * * *'
+    # Run hourly at off-peak minute 20 (Greek Ministry dynamic feed updates continuously)
+    # 28s execution time per run; delivers near-live connector availability across Greek CPOs
+    - cron: '20 * * * *'
   workflow_dispatch:
 
 permissions:
