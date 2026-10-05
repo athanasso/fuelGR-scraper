@@ -71,16 +71,21 @@ try {
     python scraper_ev.py
     if ($LASTEXITCODE -ne 0) { throw "scraper_ev.py failed" }
 
-    $tagFile = Join-Path 'dist' 'tag.txt'
-    $TAG = $null
-    if (Test-Path $tagFile) {
-      $TAG = (Get-Content $tagFile -Raw).Trim()
-    }
+    # Always target current active latest release on GitHub so latest/download stays updated
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $TAG = (gh release view --json tagName -q .tagName 2>$null)
+    $ErrorActionPreference = $prevEap
+
     if (-not $TAG) {
-      $prevEap = $ErrorActionPreference
-      $ErrorActionPreference = 'Continue'
-      $TAG = (gh release view --json tagName -q .tagName 2>$null)
-      $ErrorActionPreference = $prevEap
+      $tagFile = Join-Path 'dist' 'tag.txt'
+      if (Test-Path $tagFile) {
+        $TAG = (Get-Content $tagFile -Raw).Trim()
+      }
+    } else {
+      # Keep local dist/tag.txt in sync
+      New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+      Set-Content -Path (Join-Path 'dist' 'tag.txt') -Value $TAG
     }
     if (-not $TAG) {
       throw "No existing release tag found in dist/tag.txt or GitHub releases"
