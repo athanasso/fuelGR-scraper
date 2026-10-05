@@ -87,3 +87,60 @@ node reviews_scraper.js --limit 50 --concurrency 1 --delay-min 5000 --delay-max 
 # Package and compress artifacts into dist/
 python package_dataset.py
 ```
+
+---
+
+## Windows Task Scheduler Automation
+
+Because Cloudflare WAF on `fuelgr.gr` actively challenges datacenter IP addresses (GitHub Actions runners), running the scraper locally on a Greek residential broadband connection (OTE, Vodafone, Nova) bypasses WAF challenges completely with HTTP 200 responses.
+
+The repository includes a turnkey Windows Task Scheduler integration that automates the entire scraping, packaging, and GitHub Releases publishing workflow with zero maintenance.
+
+### Recommended Schedule Rationale
+
+| Task | Frequency | Time (Greek Local / EEST) | Why |
+| :--- | :--- | :--- | :--- |
+| **`FuelGR-DailyScraper`** | Twice daily | **08:00** & **16:00** | Greek gas stations are legally mandated to submit price updates to the Ministry of Development (`fuelprices.gr` / e-Katanalotis) in the early morning (06:00–07:30) and afternoon (14:00–15:30). Running at 08:00 and 16:00 captures all updates in time for morning and evening commutes. |
+| **`FuelGR-EVHourly`** | Every 1 hour | **00:00–23:00 (Hourly)** | Electric vehicle chargers report dynamic live connector status (`available`, `occupied`, `out_of_service`) from official Ministry (MYFAH/IDRO) OCPI feeds. The task runs in ~25 seconds and uploads directly to the active release with `--clobber`. |
+
+Both tasks are configured with:
+- **`Hidden` Window Style**: Completely silent execution in the background (no popup windows stealing focus).
+- **`StartWhenAvailable`**: If your PC was turned off or asleep during a scheduled run, Task Scheduler runs the missed job immediately upon waking up.
+- **Battery Support**: Enabled for laptops on battery (`AllowStartIfOnBatteries`).
+- **Single Instance**: Prevents overlapping runs (`MultipleInstances IgnoreNew`).
+- **Transcript Logging**: All output is automatically logged with timestamps to `logs/scraper_daily.log` and `logs/ev_hourly.log`.
+
+### Setup & Installation
+
+Run once from PowerShell (or terminal):
+
+```powershell
+# Using npm script:
+npm run tasks:setup
+
+# Or directly in PowerShell:
+powershell -ExecutionPolicy Bypass -File .\setup-tasks.ps1
+```
+
+### Checking Status & Logs
+
+```powershell
+# Inspect registered task status:
+Get-ScheduledTask -TaskName "FuelGR-*" | Select-Object TaskName, State, LastRunTime, NextRunTime
+
+# Manually trigger a run anytime:
+Start-ScheduledTask -TaskName "FuelGR-DailyScraper"
+Start-ScheduledTask -TaskName "FuelGR-EVHourly"
+
+# Live-tail execution logs:
+Get-Content logs\scraper_daily.log -Tail 30 -Wait
+Get-Content logs\ev_hourly.log -Tail 30 -Wait
+```
+
+### Removing Scheduled Tasks
+
+```powershell
+npm run tasks:remove
+# or:
+powershell -ExecutionPolicy Bypass -File .\remove-tasks.ps1
+```

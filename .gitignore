@@ -8,3 +8,5 @@ public/
 dist/
 data/
 .playwright/
+logs/
+*.log

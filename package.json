@@ -9,7 +9,10 @@
     "scrape:reviews": "node reviews_scraper.js",
     "publish:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1",
     "publish:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -UploadOnly",
-    "scrape:ev": "python scraper_ev.py"
+    "scrape:ev": "python scraper_ev.py",
+    "publish:ev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -EVOnly",
+    "tasks:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File ./setup-tasks.ps1",
+    "tasks:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File ./remove-tasks.ps1"
   },
   "dependencies": {
     "playwright": "^1.40.0"
