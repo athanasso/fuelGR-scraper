@@ -287,10 +287,114 @@ function generateScanGrid(mode = 'discovery') {
   return Array.from(points.values());
 }
 
+let browserInstance = null;
+let browserContext = null;
+let browserPage = null;
+
+async function initBrowserSession() {
+  try {
+    const { chromium } = require('playwright');
+    console.log('[browser] Launching stealth Chromium session...');
+    browserInstance = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
+      ]
+    });
+    browserContext = await browserInstance.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      viewport: { width: 1366, height: 768 },
+      locale: 'el-GR',
+      timezoneId: 'Europe/Athens'
+    });
+    browserPage = await browserContext.newPage();
+    await browserPage.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    console.log('[browser] Navigating to https://fuelgr.gr/web/ ...');
+    await browserPage.goto('https://fuelgr.gr/web/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    for (let i = 0; i < 15; i++) {
+      const title = await browserPage.title();
+      if (title.includes('fuelGR')) {
+        console.log(`[browser] Session ready: "${title}"`);
+        return true;
+      }
+      await sleep(1000);
+    }
+  } catch (err) {
+    console.warn(`[browser] Playwright launch/navigation failed: ${err.message}. Using direct HTTP.`);
+    await closeBrowserSession();
+  }
+  return false;
+}
+
+async function closeBrowserSession() {
+  if (browserInstance) {
+    try {
+      await browserInstance.close();
+    } catch {}
+    browserInstance = null;
+    browserContext = null;
+    browserPage = null;
+  }
+}
+
+async function fetchRaw(lat, lng, fuelType = 1) {
+  if (browserPage) {
+    try {
+      const result = await browserPage.evaluate(
+        async ({ lat, lng, fuelType, brands, devId }) => {
+          const fd = new FormData();
+          fd.append(
+            'ls',
+            JSON.stringify({
+              accept_cookies: 'true',
+              eh: 'false',
+              b: JSON.stringify(brands),
+              f: String(fuelType),
+              p: '3',
+              consumption: '7',
+              refuel: '30',
+              q_litres: '40',
+              zoom: 'false',
+              download: 'true',
+              logged_in: 'false',
+              d_lat: String(lat),
+              d_lng: String(lng),
+              deviceId: devId,
+              mobile_user: 'false',
+              sort: '0'
+            })
+          );
+          try {
+            const res = await fetch('/web/api/data.php', { method: 'POST', body: fd });
+            const raw = await res.text();
+            return { status: res.status, raw };
+          } catch {
+            return { status: 0, raw: '' };
+          }
+        },
+        { lat, lng, fuelType, brands: ALL_BRAND_IDS, devId: sessionDeviceId }
+      );
+      if (result && result.status === 200 && result.raw) {
+        return result;
+      }
+    } catch (err) {
+      // evaluate failed, fallback to HTTP
+    }
+  }
+  return fetchRawHttp(lat, lng, fuelType);
+}
+
 /**
  * POST to web API with mocked localStorage payload (multipart FormData like the browser).
  */
-function fetchRaw(lat, lng, fuelType = 1) {
+function fetchRawHttp(lat, lng, fuelType = 1) {
   return new Promise((resolve) => {
     const ls = buildLocalStoragePayload(lat, lng, fuelType);
     const boundary = '----WebKitFormBoundary' + crypto.randomBytes(8).toString('hex');
@@ -698,6 +802,8 @@ async function main() {
   console.log(`API: https://${API_HOST}${API_PATH} (web localStorage payload)`);
   console.log(`Session deviceId: ${sessionDeviceId}`);
 
+  await initBrowserSession();
+
   const probeOk = await preflightProbe();
   if (!probeOk) {
     console.error(
@@ -777,9 +883,12 @@ async function main() {
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(stations), 'utf-8');
   const sizeKb = Math.round(fs.statSync(OUTPUT_FILE).size / 1024);
   console.log(`[OK] Saved ${stations.length} stations (${sizeKb} KB) -> ${OUTPUT_FILE}`);
+  await closeBrowserSession();
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+main()
+  .catch(async (err) => {
+    console.error('Fatal error:', err);
+    await closeBrowserSession();
+    process.exit(1);
+  });
