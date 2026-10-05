@@ -46,13 +46,6 @@ jobs:
           pip install -r requirements.txt
           npm install
 
-      - name: Set up Cloudflare WARP
-        uses: fscarmen/warp-on-actions@v1.4
-        continue-on-error: true
-        with:
-          stack: dual
-          mode: wireguard
-
       - name: Run prefecture fuel prices scraper
         run: python scraper.py
 
@@ -68,8 +61,8 @@ jobs:
         id: stations_retry
         continue-on-error: true
         run: |
-          echo "First scrape failed (likely HTML/IP block). Waiting 2 minutes..."
-          sleep 120
+          echo "First scrape failed (likely HTML/IP block). Waiting 30s..."
+          sleep 30
           node scraper.js
 
       - name: Fallback to existing stations dataset if scrape blocked

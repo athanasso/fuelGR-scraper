@@ -310,11 +310,17 @@ function fetchRaw(lat, lng, fuelType = 1) {
           'Content-Type': `multipart/form-data; boundary=${boundary}`,
           'Content-Length': Buffer.byteLength(body),
           'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
           Accept: '*/*',
           'Accept-Language': 'el-GR,el;q=0.9,en-US;q=0.8,en;q=0.7',
           Origin: 'https://fuelgr.gr',
-          Referer: 'https://fuelgr.gr/web/'
+          Referer: 'https://fuelgr.gr/web/',
+          'Sec-Ch-Ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+          'Sec-Ch-Ua-Mobile': '?0',
+          'Sec-Ch-Ua-Platform': '"Windows"',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-origin'
         },
         timeout: 15000
       },
@@ -392,7 +398,7 @@ async function fetchCoordinates(lat, lng, fuelType = 1, attempts = 3) {
 async function preflightProbe() {
   console.log('Preflight probe (Athens Unleaded 95)...');
   // HTML/IP blocks are often transient on GH Actions — wait longer between tries.
-  const backoffsMs = [5_000, 15_000, 45_000, 90_000, 120_000];
+  const backoffsMs = [5_000, 15_000];
   for (let attempt = 1; attempt <= backoffsMs.length; attempt++) {
     const beforeHtml = FETCH_STATS.htmlBlock || 0;
     const xml = await fetchCoordinates(37.9838, 23.7275, 1, 2);
