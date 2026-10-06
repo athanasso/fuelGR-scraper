@@ -529,8 +529,8 @@ def build_master_and_history(
     address = str(raw.get("address", "")).strip()
     prefecture = str(raw.get("prefecture", "")).strip()
     municipality = str(raw.get("municipality", "")).strip()
-    lat = raw.get("latitude")
-    lng = raw.get("longitude")
+    lat = raw.get("latitude", raw.get("lat"))
+    lng = raw.get("longitude", raw.get("lng"))
     last_updated = raw.get("last_updated") or today
 
     # Compact schema passthrough when packaging already-minified input
@@ -543,6 +543,17 @@ def build_master_and_history(
         lat = raw.get("lat", lat)
         lng = raw.get("lng", lng)
         last_updated = raw.get("dt") or last_updated
+
+    # Normalize coords (deixto scraper uses lat/lng; never ship null pins)
+    try:
+        lat = float(lat) if lat is not None else None
+        lng = float(lng) if lng is not None else None
+    except (TypeError, ValueError):
+        lat, lng = None, None
+    if lat is not None and not (34.0 <= lat <= 42.0):
+        lat = None
+    if lng is not None and not (19.0 <= lng <= 29.0):
+        lng = None
 
     prices = extract_prices(raw)
     # Don't drop diesel/u100 for one incomplete scrape — carry recent ledger gaps forward
@@ -715,7 +726,20 @@ def main():
             json.dump(master_stations, f, ensure_ascii=False, indent=2)
 
         compress_zstd(station_min_file, dist_dir / "stations_latest.min.json.zst")
-        print(f"[OK] Master stations dataset written ({station_min_file.stat().st_size:,} bytes).")
+        missing_coords = sum(
+            1
+            for s in master_stations
+            if not isinstance(s.get("lat"), (int, float)) or not isinstance(s.get("lng"), (int, float))
+        )
+        if master_stations and missing_coords / len(master_stations) > 0.05:
+            raise SystemExit(
+                f"[!] Abort: {missing_coords}/{len(master_stations)} stations missing lat/lng "
+                f"— refusing to publish a blank map."
+            )
+        print(
+            f"[OK] Master stations dataset written ({station_min_file.stat().st_size:,} bytes) "
+            f"(missing coords: {missing_coords})."
+        )
         print(f"[OK] Ledger stations={len(ledger)} bytes={ledger_dist.stat().st_size:,}.")
         print(f"[OK] Generated {len(raw_stations)} history files in {history_dir}.")
     else:
