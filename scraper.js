@@ -7,10 +7,10 @@
  * - Valid fuels: 1=u95, 2=98/100, 4=diesel, 5=heating, 6=lpg, 8=cng.
  *
  * Strategy for full coverage without fuelgr.gr:
- * 1. Dense ~22 km hex mesh over Greece + island hubs (30 km circles overlap).
- * 2. Nationwide mesh passes for core fuels (1, 4, 2, 6).
- * 3. Exact-coordinate backfill for stations still missing those fuels.
- * 4. Lighter mesh + backfill for heating (5) and CNG (8).
+ * 1. Dense ~22 km hex mesh — ALL fuels nationwide (1,2,4,5,6,8).
+ * 2. Concurrent mesh workers for speed.
+ * 3. Exact-coordinate backfill for u95 + diesel (gate fuels) + plateau abort.
+ * 4. Refresh backfill for known LPG/heating/CNG sellers from baseline (not every station).
  * 5. Coverage gates vs previous snapshot — refuse to write a thin dataset.
  *
  * Outputs: data/stations_latest.min.json
@@ -27,7 +27,7 @@ const RELEASE_STATIONS_URL =
 
 const AGENT = new https.Agent({
   keepAlive: true,
-  maxSockets: 4,
+  maxSockets: 8,
   timeout: 20000
 });
 
@@ -35,11 +35,30 @@ const MIN_PRICE = 0.4;
 const MAX_PRICE = 5.0;
 const RADIUS_KM = 30; // deixto hard-caps; larger d returns empty
 const MESH_SPACING_KM = 22;
+const MESH_CONCURRENCY = 4;
+const MESH_DELAY_MS = [80, 160]; // [min, max] between requests per worker
+const BACKFILL_DELAY_MS = [100, 180];
+/** Stop backfill after this many consecutive queries with zero gains */
+const BACKFILL_PLATEAU = 80;
+/** Hard cap for high-octane optional backfill */
+const BACKFILL_OPTIONAL_MAX = 400;
 
-/** Core fuels scraped on the full mesh + backfill */
-const CORE_FUELS = [1, 4, 2, 6];
-/** Sparse fuels — urban mesh + backfill only */
-const SPARSE_FUELS = [5, 8];
+/** Every fuel we publish — full nationwide mesh (replaces fuelgr.gr) */
+const ALL_FUELS = [1, 4, 2, 6, 5, 8];
+const FUEL_LABELS = {
+  1: 'Pass u95',
+  4: 'Pass diesel',
+  2: 'Pass u98/u100',
+  6: 'Pass LPG',
+  5: 'Pass heating',
+  8: 'Pass CNG'
+};
+/** Must hit coverage gates — full coord backfill */
+const BACKFILL_REQUIRED = [1, 4];
+/** Nice-to-have high-octane — capped + plateau abort */
+const BACKFILL_OPTIONAL = [2];
+/** Sparse retail fuels — only re-query stations that already sold them before */
+const BACKFILL_KNOWN_SELLERS = [6, 5, 8];
 
 const DEV_ID = 'android.4.0-' + crypto.randomBytes(8).toString('hex');
 let requestsCount = 0;
@@ -53,6 +72,10 @@ const GATE_MIN_VS_PREV_PCT = 97; // must keep >=97% of previous station count
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitter([min, max]) {
+  return min + Math.floor(Math.random() * (max - min + 1));
 }
 
 function isPremiumDieselName(name) {
@@ -372,6 +395,18 @@ function normalizeBaselineStation(s) {
 
 async function loadBaseline(stationsMap) {
   let loaded = 0;
+  /** stationId -> Set of fuel ids that baseline already had */
+  const knownSellers = new Map();
+
+  function noteSellers(s) {
+    const id = String(s.id);
+    const set = knownSellers.get(id) || new Set();
+    for (const fid of BACKFILL_KNOWN_SELLERS) {
+      if (hasFuel(s, fid)) set.add(fid);
+    }
+    if (set.size) knownSellers.set(id, set);
+  }
+
   if (fs.existsSync(OUTPUT_FILE)) {
     try {
       const existing = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
@@ -380,6 +415,7 @@ async function loadBaseline(stationsMap) {
           const s = normalizeBaselineStation(raw);
           if (s?.id) {
             stationsMap.set(String(s.id), s);
+            noteSellers(s);
             loaded++;
           }
         }
@@ -396,56 +432,93 @@ async function loadBaseline(stationsMap) {
         const s = normalizeBaselineStation(raw);
         if (s?.id) {
           stationsMap.set(String(s.id), s);
+          noteSellers(s);
           loaded++;
         }
       }
     }
   }
-  console.log(`Baseline stations loaded: ${loaded}`);
-  return loaded;
+  console.log(
+    `Baseline stations loaded: ${loaded} (known sparse sellers: ${knownSellers.size})`
+  );
+  return { loaded, knownSellers };
 }
 
 async function runMeshPass(stationsMap, mesh, fuelId, label) {
-  console.log(`\n[${label}] fuel=${fuelId} across ${mesh.length} points...`);
+  console.log(
+    `\n[${label}] fuel=${fuelId} across ${mesh.length} points (concurrency=${MESH_CONCURRENCY})...`
+  );
   let newHits = 0;
-  for (let i = 0; i < mesh.length; i++) {
-    const [lat, lng] = mesh[i];
-    const found = await queryCoordinates(lat, lng, fuelId);
-    for (const s of found) {
-      const id = String(s.id);
-      if (!stationsMap.has(id)) {
-        stationsMap.set(id, s);
-        newHits++;
-      } else {
-        stationsMap.set(id, mergeStation(stationsMap.get(id), s));
+  let done = 0;
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= mesh.length) return;
+      const [lat, lng] = mesh[i];
+      const found = await queryCoordinates(lat, lng, fuelId);
+      for (const s of found) {
+        const id = String(s.id);
+        if (!stationsMap.has(id)) {
+          stationsMap.set(id, s);
+          newHits++;
+        } else {
+          stationsMap.set(id, mergeStation(stationsMap.get(id), s));
+        }
       }
+      done++;
+      if (done % 50 === 0 || done === mesh.length) {
+        process.stdout.write(
+          `\r  ${label}: ${done}/${mesh.length} (${Math.round((done / mesh.length) * 100)}%) ` +
+            `stations=${stationsMap.size} req=${requestsCount}   `
+        );
+      }
+      await sleep(jitter(MESH_DELAY_MS));
     }
-    if ((i + 1) % 25 === 0 || i + 1 === mesh.length) {
-      process.stdout.write(
-        `\r  ${label}: ${i + 1}/${mesh.length} (${Math.round(((i + 1) / mesh.length) * 100)}%) ` +
-          `stations=${stationsMap.size} req=${requestsCount}   `
-      );
-    }
-    await sleep(220 + Math.floor(Math.random() * 120));
   }
+
+  await Promise.all(Array.from({ length: MESH_CONCURRENCY }, () => worker()));
   console.log(`\n  ${label} done (+${newHits} new).`);
 }
 
-async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
+/**
+ * Exact-coord backfill.
+ * - Plateau abort after N consecutive zero-gain queries.
+ * - onlyIds: restrict to known sellers (sparse fuels).
+ */
+async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill', opts = {}) {
+  const plateau = opts.plateau ?? BACKFILL_PLATEAU;
+  const maxQueries = opts.maxQueries ?? Infinity;
+  const onlyIds = opts.onlyIds instanceof Set ? opts.onlyIds : null;
+
   for (const fuelId of fuelIds) {
-    const pending = [...stationsMap.values()].filter((s) => !hasFuel(s, fuelId));
+    let pending = [...stationsMap.values()].filter((s) => !hasFuel(s, fuelId));
+    if (onlyIds) pending = pending.filter((s) => onlyIds.has(String(s.id)));
     console.log(
-      `\n[${label}] fuel=${fuelId}: ${pending.length} stations missing (neighbours may fill).`
+      `\n[${label}] fuel=${fuelId}: ${pending.length} candidates` +
+        (onlyIds ? ' (known sellers only)' : '') +
+        (Number.isFinite(maxQueries) ? ` cap=${maxQueries}` : '') +
+        ` plateau=${plateau}`
     );
+    if (pending.length === 0) continue;
+
     let queried = 0;
     let gained = 0;
+    let streakEmpty = 0;
+
     for (let i = 0; i < pending.length; i++) {
+      if (queried >= maxQueries) {
+        console.log(`\n  [${label} f=${fuelId}] hit query cap ${maxQueries} — stop.`);
+        break;
+      }
       const s = pending[i];
       if (hasFuel(stationsMap.get(String(s.id)), fuelId)) continue;
       const coords = stationCoords(s);
       if (!coords) continue;
 
       queried++;
+      const beforeGained = gained;
       const found = await queryCoordinates(coords.lat, coords.lng, fuelId);
       for (const hit of found) {
         const id = String(hit.id);
@@ -456,15 +529,27 @@ async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
         if (!had && hasFuel(stationsMap.get(id), fuelId)) gained++;
       }
 
+      if (gained === beforeGained) streakEmpty++;
+      else streakEmpty = 0;
+
       if (queried % 25 === 0 || i + 1 === pending.length) {
-        const still = [...stationsMap.values()].filter((x) => !hasFuel(x, fuelId)).length;
+        const still = pending.filter(
+          (x) => !hasFuel(stationsMap.get(String(x.id)), fuelId)
+        ).length;
         process.stdout.write(
-          `\r  [${label} f=${fuelId}] queried=${queried} gained=+${gained} stillMissing=${still}   `
+          `\r  [${label} f=${fuelId}] queried=${queried} gained=+${gained} stillMissing=${still} streak0=${streakEmpty}   `
         );
       }
-      await sleep(180 + Math.floor(Math.random() * 100));
+
+      if (streakEmpty >= plateau) {
+        console.log(
+          `\n  [${label} f=${fuelId}] plateau (${plateau} empty) — stop early (+${gained}).`
+        );
+        break;
+      }
+      await sleep(jitter(BACKFILL_DELAY_MS));
     }
-    if (pending.length) console.log('');
+    if (pending.length && streakEmpty < plateau && queried < maxQueries) console.log('');
   }
 }
 
@@ -514,30 +599,52 @@ function assertGates(stats, prevCount) {
 async function main() {
   console.log(`[${new Date().toISOString()}] Starting deixto-only nationwide scraper...`);
   console.log(`Device: ${DEV_ID}`);
-  console.log(`Radius=${RADIUS_KM}km meshSpacing=${MESH_SPACING_KM}km (fuelgr.gr not used)`);
-
-  const stationsMap = new Map();
-  const prevCount = await loadBaseline(stationsMap);
-
-  const mesh = buildDenseMesh();
-  console.log(`Dense mesh points: ${mesh.length}`);
   console.log(
-    `Estimated requests: ~${mesh.length * CORE_FUELS.length} mesh + backfill + sparse`
+    `Radius=${RADIUS_KM}km meshSpacing=${MESH_SPACING_KM}km concurrency=${MESH_CONCURRENCY} (fuelgr.gr not used)`
   );
 
-  // 1) Discovery + core fuels nationwide
-  await runMeshPass(stationsMap, mesh, 1, 'Pass u95');
-  await runMeshPass(stationsMap, mesh, 4, 'Pass diesel');
-  await runMeshPass(stationsMap, mesh, 2, 'Pass u98/u100');
-  await runMeshPass(stationsMap, mesh, 6, 'Pass LPG');
+  const stationsMap = new Map();
+  const { loaded: prevCount, knownSellers } = await loadBaseline(stationsMap);
 
-  // 2) Sparse fuels on urban hubs
-  await runMeshPass(stationsMap, URBAN_HUBS, 5, 'Pass heating (urban)');
-  await runMeshPass(stationsMap, URBAN_HUBS, 8, 'Pass CNG (urban)');
+  const mesh = buildDenseMesh();
+  const meshReq = mesh.length * ALL_FUELS.length;
+  const estMinutes = Math.ceil(meshReq / MESH_CONCURRENCY / 60) + 25;
+  console.log(`Dense mesh points: ${mesh.length}`);
+  console.log(
+    `Est. mesh requests: ~${meshReq} for ALL fuels (~${estMinutes} min) + targeted backfill`
+  );
 
-  // 3) Exact-coordinate backfill until coverage gates can pass
-  await backfillMissingFuels(stationsMap, CORE_FUELS, 'Backfill-core');
-  await backfillMissingFuels(stationsMap, SPARSE_FUELS, 'Backfill-sparse');
+  // 1) Nationwide mesh for EVERY fuel
+  for (const fuelId of ALL_FUELS) {
+    await runMeshPass(stationsMap, mesh, fuelId, FUEL_LABELS[fuelId] || `Pass f=${fuelId}`);
+  }
+
+  // Extra urban densify for sparse fuels
+  for (const fuelId of [6, 5, 8]) {
+    await runMeshPass(
+      stationsMap,
+      URBAN_HUBS,
+      fuelId,
+      `${FUEL_LABELS[fuelId]} densify (urban)`
+    );
+  }
+
+  // 2) Backfill: gates fully; high-octane capped; sparse = known sellers only
+  await backfillMissingFuels(stationsMap, BACKFILL_REQUIRED, 'Backfill-core');
+  await backfillMissingFuels(stationsMap, BACKFILL_OPTIONAL, 'Backfill-optional', {
+    maxQueries: BACKFILL_OPTIONAL_MAX,
+    plateau: 40
+  });
+
+  for (const fuelId of BACKFILL_KNOWN_SELLERS) {
+    const onlyIds = new Set(
+      [...knownSellers.entries()].filter(([, set]) => set.has(fuelId)).map(([id]) => id)
+    );
+    await backfillMissingFuels(stationsMap, [fuelId], 'Backfill-known', {
+      onlyIds,
+      plateau: 50
+    });
+  }
 
   const stations = Array.from(stationsMap.values());
   const stats = coverageStats(stations);
