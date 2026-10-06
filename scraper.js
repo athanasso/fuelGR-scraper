@@ -1,12 +1,17 @@
 /**
- * FuelGR Nationwide Station Price Scraper
+ * FuelGR Nationwide Station Price Scraper (deixto.gr only)
  *
- * Optimized Lightweight Architecture:
- * - Direct access via deixto.gr backend (no Cloudflare WAF, no datacenter blocks)
- * - Automatic fallback to fuelgr.gr/web/api/data.php if needed
- * - Strategic 85-point regional mesh covering all 51 Greek prefectures & islands
- * - Polite pacing (~350ms delay) with ~170 requests total (down from 5,831!)
- * - Zero Cloudflare rate-limit triggering; runnable on both local PC and GitHub Actions
+ * API facts (verified):
+ * - One fuel type per request (`f`); XML contains only that fuel.
+ * - Radius `d` max useful value is 30 km (d>=40 returns empty).
+ * - Valid fuels: 1=u95, 2=98/100, 4=diesel, 5=heating, 6=lpg, 8=cng.
+ *
+ * Strategy for full coverage without fuelgr.gr:
+ * 1. Dense ~22 km hex mesh over Greece + island hubs (30 km circles overlap).
+ * 2. Nationwide mesh passes for core fuels (1, 4, 2, 6).
+ * 3. Exact-coordinate backfill for stations still missing those fuels.
+ * 4. Lighter mesh + backfill for heating (5) and CNG (8).
+ * 5. Coverage gates vs previous snapshot — refuse to write a thin dataset.
  *
  * Outputs: data/stations_latest.min.json
  */
@@ -17,18 +22,34 @@ const https = require('https');
 const crypto = require('crypto');
 
 const OUTPUT_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
+const RELEASE_STATIONS_URL =
+  'https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json';
 
 const AGENT = new https.Agent({
   keepAlive: true,
   maxSockets: 4,
-  timeout: 15000
+  timeout: 20000
 });
 
 const MIN_PRICE = 0.4;
 const MAX_PRICE = 5.0;
+const RADIUS_KM = 30; // deixto hard-caps; larger d returns empty
+const MESH_SPACING_KM = 22;
+
+/** Core fuels scraped on the full mesh + backfill */
+const CORE_FUELS = [1, 4, 2, 6];
+/** Sparse fuels — urban mesh + backfill only */
+const SPARSE_FUELS = [5, 8];
 
 const DEV_ID = 'android.4.0-' + crypto.randomBytes(8).toString('hex');
 let requestsCount = 0;
+let emptyResponses = 0;
+
+/** Publish gates (vs previous snapshot when available) */
+const GATE_MIN_STATIONS = 4300;
+const GATE_MIN_U95_PCT = 95;
+const GATE_MIN_DIESEL_PCT = 90;
+const GATE_MIN_VS_PREV_PCT = 97; // must keep >=97% of previous station count
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -129,7 +150,14 @@ function parseXmlStations(xml) {
 
     const latNum = parseFloat(lt);
     const lngNum = parseFloat(lg);
-    if (!isNaN(latNum) && !isNaN(lngNum) && latNum > 34.0 && latNum < 42.0 && lngNum > 19.0 && lngNum < 29.0) {
+    if (
+      !isNaN(latNum) &&
+      !isNaN(lngNum) &&
+      latNum > 34.0 &&
+      latNum < 42.0 &&
+      lngNum > 19.0 &&
+      lngNum < 29.0
+    ) {
       stations.push({
         id,
         name: ow || br,
@@ -151,15 +179,12 @@ function parseXmlStations(xml) {
   return stations;
 }
 
-/**
- * Fetch from deixto.gr backend (Direct nginx endpoint, no Cloudflare WAF, fast XML).
- */
 function fetchDeixto(lat, lng, fuelType = 1) {
   return new Promise((resolve) => {
     const url =
       `https://deixto.gr/fuel/get_data_v4.php?` +
       `dev=${DEV_ID}&lat=${lat.toFixed(4)}&long=${lng.toFixed(4)}` +
-      `&f=${fuelType}&b=0&d=30&p=3`;
+      `&f=${fuelType}&b=0&d=${RADIUS_KM}&p=3`;
 
     https
       .get(
@@ -171,14 +196,13 @@ function fetchDeixto(lat, lng, fuelType = 1) {
             Accept: '*/*',
             Connection: 'keep-alive'
           },
-          timeout: 10000
+          timeout: 15000
         },
         (res) => {
-          let chunks = [];
+          const chunks = [];
           res.on('data', (c) => chunks.push(c));
           res.on('end', () => {
-            const xml = Buffer.concat(chunks).toString('utf8');
-            resolve({ status: res.statusCode || 0, xml });
+            resolve({ status: res.statusCode || 0, xml: Buffer.concat(chunks).toString('utf8') });
           });
         }
       )
@@ -190,86 +214,13 @@ function fetchDeixto(lat, lng, fuelType = 1) {
   });
 }
 
-/**
- * Fallback to fuelgr.gr/web/api/data.php if needed.
- */
-function fetchWeb(lat, lng, fuelType = 1) {
-  return new Promise((resolve) => {
-    const ls = JSON.stringify({
-      accept_cookies: 'true',
-      eh: 'false',
-      b: JSON.stringify(['7','1','16','6','10','20','13','12','8','15','11','5','22','2','17','14','18','9','3','4','19','23','21']),
-      f: String(fuelType),
-      p: '3',
-      consumption: '7',
-      refuel: '30',
-      q_litres: '40',
-      zoom: 'false',
-      download: 'true',
-      logged_in: 'false',
-      d_lat: String(lat),
-      d_lng: String(lng),
-      deviceId: 'web.' + crypto.randomUUID(),
-      mobile_user: 'false',
-      sort: '0'
-    });
-    const boundary = '----WebKitFormBoundary' + crypto.randomBytes(8).toString('hex');
-    const body = `--${boundary}\r\nContent-Disposition: form-data; name="ls"\r\n\r\n${ls}\r\n--${boundary}--\r\n`;
-
-    const req = https.request(
-      {
-        hostname: 'fuelgr.gr',
-        path: '/web/api/data.php',
-        method: 'POST',
-        agent: AGENT,
-        headers: {
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          'Content-Length': Buffer.byteLength(body),
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36',
-          Referer: 'https://fuelgr.gr/web/'
-        },
-        timeout: 10000
-      },
-      (res) => {
-        let chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          let xml = '';
-          try {
-            const n = raw.length;
-            const f = Math.floor(n / 3);
-            const reassembled = raw.slice(n - f) + raw.slice(n - 2 * f, n - f) + raw.slice(0, n - 2 * f);
-            xml = Buffer.from(reassembled, 'base64').toString('utf8');
-          } catch {}
-          resolve({ status: res.statusCode || 0, xml });
-        });
-      }
-    );
-    req.on('error', () => resolve({ status: 0, xml: '' }));
-    req.on('timeout', function () {
-      this.destroy();
-      resolve({ status: 0, xml: '' });
-    });
-    req.write(body);
-    req.end();
-  });
-}
-
 async function queryCoordinates(lat, lng, fuelType = 1) {
   requestsCount++;
-  // 1. Try direct backend (no Cloudflare WAF, fast, unblocked)
-  let res = await fetchDeixto(lat, lng, fuelType);
+  const res = await fetchDeixto(lat, lng, fuelType);
   if (res.status === 200 && res.xml && res.xml.includes('<gs id=')) {
     return parseXmlStations(res.xml);
   }
-
-  // 2. Try web endpoint fallback if deixto was empty
-  res = await fetchWeb(lat, lng, fuelType);
-  if (res.status === 200 && res.xml && res.xml.includes('<gs id=')) {
-    return parseXmlStations(res.xml);
-  }
-
+  emptyResponses++;
   return [];
 }
 
@@ -293,51 +244,75 @@ function mergeStation(base, incoming) {
   }
   if (!merged.address && incoming.address) merged.address = incoming.address;
   if (incoming.brand && incoming.brand !== 'Ανεξάρτητο') merged.brand = incoming.brand;
+  if (incoming.name && incoming.name !== 'Πρατήριο Καυσίμων') merged.name = incoming.name;
+  if (incoming.prefecture) merged.prefecture = incoming.prefecture;
+  if (incoming.municipality) merged.municipality = incoming.municipality;
   return merged;
 }
 
-/**
- * High-efficiency Nationwide Regional Mesh:
- * ~85 strategic coordinate points covering all 51 prefectures and major islands.
- * Each 30km radius circle provides dense spatial overlap across all Greek highways and municipalities.
- */
-const REGIONAL_MESH = [
-  // Attica (denser grid)
-  [37.9838, 23.7275], [38.0500, 23.8000], [37.9400, 23.6500], [37.8300, 23.7700], [38.1000, 23.5500],
-  [38.0000, 23.9500], [37.7200, 24.0500],
-  // Central Greece & Evia
-  [38.4633, 23.5976], [38.3197, 23.3178], [38.5300, 23.8500], [38.0500, 24.3000], [38.9000, 22.4333],
-  [38.7500, 22.7500], [38.4333, 22.8750], [38.5300, 22.3800], [38.9167, 21.7833], [38.8000, 21.5000],
-  // Peloponnese
-  [37.9405, 22.9322], [38.0000, 22.5000], [38.2466, 21.7346], [38.1500, 22.1000], [37.8500, 21.3000],
-  [37.6744, 21.4397], [37.5683, 22.8067], [37.5089, 22.3794], [37.0389, 22.1142], [36.8000, 21.7000],
-  [37.0733, 22.4297], [36.7500, 22.5500], [37.3500, 23.1500],
-  // Western Greece & Epirus
-  [38.3742, 21.4300], [38.6253, 21.4093], [38.8500, 21.1500], [39.1600, 20.9850], [38.9500, 20.7500],
-  [39.6650, 20.8537], [39.5000, 20.2667], [39.9500, 20.6500], [39.8000, 21.1500],
-  // Thessaly
-  [39.6390, 22.4191], [39.3622, 22.9422], [39.1500, 22.8500], [39.5557, 21.7679], [39.3649, 21.9214],
-  [39.8000, 22.1500], [40.0000, 22.5000],
-  // Central & West Macedonia
-  [40.6401, 22.9444], [40.5500, 23.0000], [40.7000, 22.7000], [40.2709, 22.5061], [40.5244, 22.2033],
-  [40.8017, 22.0478], [40.7936, 22.4339], [40.9933, 22.8744], [40.3006, 21.7889], [40.4077, 21.6789],
-  [40.7820, 21.4098], [40.5217, 21.2633], [40.0847, 21.4278],
-  // Chalkidiki & East Macedonia & Thrace
-  [40.3500, 23.4500], [40.1000, 23.7500], [40.4000, 23.8500], [41.0849, 23.5476], [40.9396, 24.4129],
-  [41.1500, 24.1500], [41.1350, 24.8878], [41.1192, 25.4054], [40.8457, 25.8740], [41.3500, 26.5000],
-  // Crete
-  [35.5138, 24.0180], [35.3644, 24.4719], [35.3387, 25.1442], [35.1000, 24.9000], [35.1914, 25.7153],
-  [35.0117, 25.7422], [35.2000, 26.1000],
-  // Ionian Islands
-  [39.6243, 19.9217], [39.7500, 19.8000], [38.8333, 20.7000], [38.1750, 20.4889], [37.7878, 20.8978],
-  // Aegean & Dodecanese Islands
-  [36.4349, 28.2175], [36.1500, 27.9500], [36.8933, 27.2889], [37.7500, 26.9833], [38.3678, 26.1358],
-  [39.1100, 26.5547], [39.9167, 25.2500], [37.4417, 24.9417], [37.4467, 25.3289], [37.1036, 25.3764],
-  [36.3932, 25.4615], [35.8500, 27.1333]
-];
+function stationCoords(s) {
+  const lat = Number(s.lat ?? s.latitude);
+  const lng = Number(s.lng ?? s.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < 34 || lat > 42 || lng < 19 || lng > 29) return null;
+  return { lat, lng };
+}
 
-// Top urban clusters for multi-fuel enrichment (u100 & LPG)
-const URBAN_ENRICH_CENTERS = [
+function hasFuel(s, fuelId) {
+  const key = String(fuelId);
+  if (!s?.fuels) return false;
+  if (s.fuels[key]) return true;
+  if (fuelId === 4 && s.fuels.dp) return true;
+  if (fuelId === 2 && (s.fuels.u98 || s.fuels.u100)) return true;
+  return false;
+}
+
+/**
+ * Dense hex mesh. Spacing ~22 km so 30 km radius circles overlap.
+ * Extra island hubs cover sea gaps the bbox grid skips.
+ */
+function buildDenseMesh() {
+  const points = [];
+  const seen = new Set();
+  const add = (lat, lng) => {
+    const key = `${lat.toFixed(3)},${lng.toFixed(3)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    points.push([lat, lng]);
+  };
+
+  const latMin = 34.85;
+  const latMax = 41.75;
+  const lngMin = 19.35;
+  const lngMax = 28.25;
+  const dLat = MESH_SPACING_KM / 111.0;
+  const midLat = 38.0;
+  const dLng = MESH_SPACING_KM / (111.0 * Math.cos((midLat * Math.PI) / 180));
+
+  let row = 0;
+  for (let lat = latMin; lat <= latMax; lat += dLat * 0.866) {
+    const offset = row % 2 === 0 ? 0 : dLng / 2;
+    for (let lng = lngMin + offset; lng <= lngMax; lng += dLng) {
+      add(Number(lat.toFixed(4)), Number(lng.toFixed(4)));
+    }
+    row++;
+  }
+
+  // Island / edge hubs the hex might under-sample
+  const hubs = [
+    [35.5138, 24.0180], [35.3387, 25.1442], [35.1914, 25.7153], [35.0117, 25.7422],
+    [36.4349, 28.2175], [36.8933, 27.2889], [37.4467, 25.3289], [36.3932, 25.4615],
+    [39.6243, 19.9217], [38.8333, 20.7000], [38.1750, 20.4889], [37.7878, 20.8978],
+    [39.1100, 26.5547], [38.3678, 26.1358], [39.9167, 25.2500], [37.4417, 24.9417],
+    [40.8457, 25.8740], [41.1192, 25.4054], [41.3500, 26.5000], [40.1000, 23.7500],
+    [35.8500, 27.1333], [36.1500, 27.9500], [37.7500, 26.9833]
+  ];
+  for (const [lat, lng] of hubs) add(lat, lng);
+
+  return points;
+}
+
+const URBAN_HUBS = [
   [37.9838, 23.7275], [38.0500, 23.8000], [37.9400, 23.6500], [38.1000, 23.5500],
   [40.6401, 22.9444], [40.5500, 23.0000], [38.2466, 21.7346], [35.3387, 25.1442],
   [39.6390, 22.4191], [39.3622, 22.9422], [39.6650, 20.8537], [37.0389, 22.1142],
@@ -345,107 +320,252 @@ const URBAN_ENRICH_CENTERS = [
   [36.4349, 28.2175], [40.2709, 22.5061], [38.9000, 22.4333], [37.9405, 22.9322]
 ];
 
-async function main() {
-  console.log(`[${new Date().toISOString()}] Starting Greek Nationwide Gas Stations Scraper...`);
-  console.log(`Architecture: Direct API via deixto.gr + fallback, ~170 total requests`);
+async function fetchJson(url) {
+  return new Promise((resolve) => {
+    https
+      .get(url, { headers: { 'User-Agent': 'fuelGR-scraper/2.0' }, timeout: 60000 }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+          } catch {
+            resolve(null);
+          }
+        });
+      })
+      .on('error', () => resolve(null));
+  });
+}
 
-  const stationsMap = new Map();
+function normalizeBaselineStation(s) {
+  // Accept raw scraper schema or packaged master schema
+  if (s.fuels && s.lat != null) return s;
+  if (s.p && (s.lat != null || s.latitude != null)) {
+    const fuels = {};
+    const p = s.p || {};
+    if (p.u95) fuels['1'] = { price: p.u95, name: 'Unleaded 95', date: s.dt || '' };
+    if (p.u98) fuels.u98 = { price: p.u98, name: 'Unleaded 98', date: s.dt || '' };
+    if (p.u100) fuels.u100 = { price: p.u100, name: 'Unleaded 100', date: s.dt || '' };
+    if (p.d) fuels['4'] = { price: p.d, name: 'Diesel', date: s.dt || '' };
+    if (p.dp) fuels.dp = { price: p.dp, name: 'Diesel Premium', date: s.dt || '' };
+    if (p.dh) fuels['5'] = { price: p.dh, name: 'Heating', date: s.dt || '' };
+    if (p.lpg) fuels['6'] = { price: p.lpg, name: 'LPG', date: s.dt || '' };
+    if (p.cng) fuels['8'] = { price: p.cng, name: 'CNG', date: s.dt || '' };
+    return {
+      id: String(s.id),
+      name: s.n || s.name || '',
+      brand: s.b || s.brand || 'Ανεξάρτητο',
+      address: s.a || s.address || '',
+      prefecture: s.pref || s.prefecture || '',
+      municipality: s.mun || s.municipality || '',
+      lat: s.lat ?? s.latitude,
+      lng: s.lng ?? s.longitude,
+      fuels,
+      price: p.u95 || null,
+      fuel: 'Unleaded 95',
+      last_updated: s.dt || ''
+    };
+  }
+  return null;
+}
 
-  // 1. Load baseline dataset if present so existing metadata/fuels are preserved
+async function loadBaseline(stationsMap) {
+  let loaded = 0;
   if (fs.existsSync(OUTPUT_FILE)) {
     try {
       const existing = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
-      if (Array.isArray(existing) && existing.length > 0) {
-        console.log(`Loaded ${existing.length} stations from existing baseline.`);
-        for (const s of existing) {
-          if (s && s.id) stationsMap.set(String(s.id), s);
+      if (Array.isArray(existing)) {
+        for (const raw of existing) {
+          const s = normalizeBaselineStation(raw);
+          if (s?.id) {
+            stationsMap.set(String(s.id), s);
+            loaded++;
+          }
         }
       }
     } catch (e) {
-      console.warn('Could not read existing baseline:', e.message);
+      console.warn('Local baseline unreadable:', e.message);
     }
   }
+  if (loaded === 0) {
+    console.log('Fetching previous release stations as baseline...');
+    const remote = await fetchJson(RELEASE_STATIONS_URL);
+    if (Array.isArray(remote)) {
+      for (const raw of remote) {
+        const s = normalizeBaselineStation(raw);
+        if (s?.id) {
+          stationsMap.set(String(s.id), s);
+          loaded++;
+        }
+      }
+    }
+  }
+  console.log(`Baseline stations loaded: ${loaded}`);
+  return loaded;
+}
 
-  // 2. Pass 1: Unleaded 95 (fuel=1) nationwide mesh
-  console.log(`\n[Pass 1/3] Scraping Unleaded 95 across ${REGIONAL_MESH.length} regional centers...`);
-  let p1Hits = 0;
-  for (let i = 0; i < REGIONAL_MESH.length; i++) {
-    const [lat, lng] = REGIONAL_MESH[i];
-    const found = await queryCoordinates(lat, lng, 1);
+async function runMeshPass(stationsMap, mesh, fuelId, label) {
+  console.log(`\n[${label}] fuel=${fuelId} across ${mesh.length} points...`);
+  let newHits = 0;
+  for (let i = 0; i < mesh.length; i++) {
+    const [lat, lng] = mesh[i];
+    const found = await queryCoordinates(lat, lng, fuelId);
     for (const s of found) {
       const id = String(s.id);
       if (!stationsMap.has(id)) {
         stationsMap.set(id, s);
-        p1Hits++;
+        newHits++;
       } else {
         stationsMap.set(id, mergeStation(stationsMap.get(id), s));
       }
     }
-    process.stdout.write(`\r  Pass 1: ${i + 1}/${REGIONAL_MESH.length} (${Math.round(((i + 1) / REGIONAL_MESH.length) * 100)}%) -> ${stationsMap.size} stations`);
-    await sleep(250 + Math.floor(Math.random() * 150));
+    if ((i + 1) % 25 === 0 || i + 1 === mesh.length) {
+      process.stdout.write(
+        `\r  ${label}: ${i + 1}/${mesh.length} (${Math.round(((i + 1) / mesh.length) * 100)}%) ` +
+          `stations=${stationsMap.size} req=${requestsCount}   `
+      );
+    }
+    await sleep(220 + Math.floor(Math.random() * 120));
   }
-  console.log(`\n  Pass 1 done: discovered ${p1Hits} new stations.`);
+  console.log(`\n  ${label} done (+${newHits} new).`);
+}
 
-  // 3. Pass 2: Diesel (fuel=4) nationwide mesh
-  console.log(`\n[Pass 2/3] Scraping Diesel across ${REGIONAL_MESH.length} regional centers...`);
-  for (let i = 0; i < REGIONAL_MESH.length; i++) {
-    const [lat, lng] = REGIONAL_MESH[i];
-    const found = await queryCoordinates(lat, lng, 4);
-    for (const s of found) {
-      const id = String(s.id);
-      if (!stationsMap.has(id)) {
-        stationsMap.set(id, s);
-      } else {
-        stationsMap.set(id, mergeStation(stationsMap.get(id), s));
+async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill') {
+  for (const fuelId of fuelIds) {
+    const pending = [...stationsMap.values()].filter((s) => !hasFuel(s, fuelId));
+    console.log(
+      `\n[${label}] fuel=${fuelId}: ${pending.length} stations missing (neighbours may fill).`
+    );
+    let queried = 0;
+    let gained = 0;
+    for (let i = 0; i < pending.length; i++) {
+      const s = pending[i];
+      if (hasFuel(stationsMap.get(String(s.id)), fuelId)) continue;
+      const coords = stationCoords(s);
+      if (!coords) continue;
+
+      queried++;
+      const found = await queryCoordinates(coords.lat, coords.lng, fuelId);
+      for (const hit of found) {
+        const id = String(hit.id);
+        if (!stationsMap.has(id)) continue;
+        const before = stationsMap.get(id);
+        const had = hasFuel(before, fuelId);
+        stationsMap.set(id, mergeStation(before, hit));
+        if (!had && hasFuel(stationsMap.get(id), fuelId)) gained++;
       }
-    }
-    process.stdout.write(`\r  Pass 2: ${i + 1}/${REGIONAL_MESH.length} (${Math.round(((i + 1) / REGIONAL_MESH.length) * 100)}%) -> ${stationsMap.size} stations`);
-    await sleep(250 + Math.floor(Math.random() * 150));
-  }
-  console.log(`\n  Pass 2 done.`);
 
-  // 4. Pass 3: Urban clusters enrichment for Unleaded 100 (fuel=2) and LPG (fuel=6)
-  console.log(`\n[Pass 3/3] Scraping u100 & LPG across ${URBAN_ENRICH_CENTERS.length} urban hubs...`);
-  for (let i = 0; i < URBAN_ENRICH_CENTERS.length; i++) {
-    const [lat, lng] = URBAN_ENRICH_CENTERS[i];
-    // u100
-    const u100List = await queryCoordinates(lat, lng, 2);
-    for (const s of u100List) {
-      const id = String(s.id);
-      if (stationsMap.has(id)) stationsMap.set(id, mergeStation(stationsMap.get(id), s));
+      if (queried % 25 === 0 || i + 1 === pending.length) {
+        const still = [...stationsMap.values()].filter((x) => !hasFuel(x, fuelId)).length;
+        process.stdout.write(
+          `\r  [${label} f=${fuelId}] queried=${queried} gained=+${gained} stillMissing=${still}   `
+        );
+      }
+      await sleep(180 + Math.floor(Math.random() * 100));
     }
-    await sleep(200);
-
-    // LPG
-    const lpgList = await queryCoordinates(lat, lng, 6);
-    for (const s of lpgList) {
-      const id = String(s.id);
-      if (stationsMap.has(id)) stationsMap.set(id, mergeStation(stationsMap.get(id), s));
-    }
-    process.stdout.write(`\r  Pass 3: ${i + 1}/${URBAN_ENRICH_CENTERS.length} hubs enriched`);
-    await sleep(250 + Math.floor(Math.random() * 150));
+    if (pending.length) console.log('');
   }
-  console.log(`\n  Pass 3 done.`);
+}
+
+function coverageStats(stations) {
+  const n = stations.length || 1;
+  const u95 = stations.filter((s) => hasFuel(s, 1)).length;
+  const diesel = stations.filter((s) => hasFuel(s, 4)).length;
+  const hi = stations.filter((s) => hasFuel(s, 2) || s.fuels?.u98 || s.fuels?.u100).length;
+  const lpg = stations.filter((s) => hasFuel(s, 6)).length;
+  const dh = stations.filter((s) => hasFuel(s, 5)).length;
+  const cng = stations.filter((s) => hasFuel(s, 8)).length;
+  return {
+    n: stations.length,
+    u95,
+    diesel,
+    hi,
+    lpg,
+    dh,
+    cng,
+    u95Pct: (100 * u95) / n,
+    dieselPct: (100 * diesel) / n
+  };
+}
+
+function assertGates(stats, prevCount) {
+  const errors = [];
+  if (stats.n < GATE_MIN_STATIONS) {
+    errors.push(`stations ${stats.n} < ${GATE_MIN_STATIONS}`);
+  }
+  if (stats.u95Pct < GATE_MIN_U95_PCT) {
+    errors.push(`u95 ${stats.u95Pct.toFixed(1)}% < ${GATE_MIN_U95_PCT}%`);
+  }
+  if (stats.dieselPct < GATE_MIN_DIESEL_PCT) {
+    errors.push(`diesel ${stats.dieselPct.toFixed(1)}% < ${GATE_MIN_DIESEL_PCT}%`);
+  }
+  if (prevCount > 0) {
+    const keepPct = (100 * stats.n) / prevCount;
+    if (keepPct < GATE_MIN_VS_PREV_PCT) {
+      errors.push(
+        `kept ${keepPct.toFixed(1)}% of previous (${stats.n}/${prevCount}) < ${GATE_MIN_VS_PREV_PCT}%`
+      );
+    }
+  }
+  return errors;
+}
+
+async function main() {
+  console.log(`[${new Date().toISOString()}] Starting deixto-only nationwide scraper...`);
+  console.log(`Device: ${DEV_ID}`);
+  console.log(`Radius=${RADIUS_KM}km meshSpacing=${MESH_SPACING_KM}km (fuelgr.gr not used)`);
+
+  const stationsMap = new Map();
+  const prevCount = await loadBaseline(stationsMap);
+
+  const mesh = buildDenseMesh();
+  console.log(`Dense mesh points: ${mesh.length}`);
+  console.log(
+    `Estimated requests: ~${mesh.length * CORE_FUELS.length} mesh + backfill + sparse`
+  );
+
+  // 1) Discovery + core fuels nationwide
+  await runMeshPass(stationsMap, mesh, 1, 'Pass u95');
+  await runMeshPass(stationsMap, mesh, 4, 'Pass diesel');
+  await runMeshPass(stationsMap, mesh, 2, 'Pass u98/u100');
+  await runMeshPass(stationsMap, mesh, 6, 'Pass LPG');
+
+  // 2) Sparse fuels on urban hubs
+  await runMeshPass(stationsMap, URBAN_HUBS, 5, 'Pass heating (urban)');
+  await runMeshPass(stationsMap, URBAN_HUBS, 8, 'Pass CNG (urban)');
+
+  // 3) Exact-coordinate backfill until coverage gates can pass
+  await backfillMissingFuels(stationsMap, CORE_FUELS, 'Backfill-core');
+  await backfillMissingFuels(stationsMap, SPARSE_FUELS, 'Backfill-sparse');
 
   const stations = Array.from(stationsMap.values());
-  const withU95 = stations.filter((s) => s.fuels && s.fuels['1']).length;
-  const withDiesel = stations.filter((s) => s.fuels && (s.fuels['4'] || s.fuels.dp)).length;
-  const withU100 = stations.filter((s) => s.fuels && (s.fuels['2'] || s.fuels.u100 || s.fuels.u98)).length;
-  const withLpg = stations.filter((s) => s.fuels && s.fuels['6']).length;
+  const stats = coverageStats(stations);
 
   console.log(`\n========================================================`);
-  console.log(`SCRAPING COMPLETE in ${requestsCount} total HTTP requests:`);
-  console.log(`  Total valid stations: ${stations.length}`);
-  console.log(`  Unleaded 95 coverage: ${withU95} (${((100 * withU95) / stations.length).toFixed(1)}%)`);
-  console.log(`  Diesel coverage     : ${withDiesel} (${((100 * withDiesel) / stations.length).toFixed(1)}%)`);
-  console.log(`  High-octane coverage: ${withU100} (${((100 * withU100) / stations.length).toFixed(1)}%)`);
-  console.log(`  LPG coverage        : ${withLpg} (${((100 * withLpg) / stations.length).toFixed(1)}%)`);
+  console.log(`SCRAPE COMPLETE — ${requestsCount} HTTP requests (empty=${emptyResponses})`);
+  console.log(`  Stations : ${stats.n}`);
+  console.log(`  Unleaded95: ${stats.u95} (${stats.u95Pct.toFixed(1)}%)`);
+  console.log(`  Diesel    : ${stats.diesel} (${stats.dieselPct.toFixed(1)}%)`);
+  console.log(`  High-oct  : ${stats.hi}`);
+  console.log(`  LPG       : ${stats.lpg}`);
+  console.log(`  Heating   : ${stats.dh}`);
+  console.log(`  CNG       : ${stats.cng}`);
   console.log(`========================================================`);
 
-  // Save minified stations
+  const gateErrors = assertGates(stats, prevCount);
+  if (gateErrors.length) {
+    console.error('\n[!] Coverage gates FAILED — refusing to overwrite stations file:');
+    for (const e of gateErrors) console.error('   -', e);
+    console.error('Previous good snapshot left untouched.');
+    process.exit(1);
+  }
+
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(stations));
-  console.log(`Saved ${stations.length} stations (${(fs.statSync(OUTPUT_FILE).size / 1024).toFixed(0)} KB) -> ${OUTPUT_FILE}`);
+  console.log(
+    `\n[OK] Saved ${stations.length} stations (${(fs.statSync(OUTPUT_FILE).size / 1024).toFixed(0)} KB) -> ${OUTPUT_FILE}`
+  );
 }
 
 main().catch((err) => {

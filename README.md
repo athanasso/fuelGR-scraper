@@ -32,7 +32,7 @@ The repository uses three automated GitHub Actions workflows for maximum reliabi
 ### 1. Twice-Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
 Scheduled **07:17 & 15:23 EEST** with backups **08:47 & 16:53** (GitHub cron often skips mornings; backups catch drops):
 - **`scraper.py`**: Fetches and parses government PDF bulletins for regional averages (Unleaded 95, 100, Diesel, LPG).
-- **`scraper.js`**: Queries 4,700+ stations nationwide via `fuelgr.gr/web/api/data.php` using mocked browser localStorage payload.
+- **`scraper.js`**: Queries 4,700+ stations nationwide via `deixto.gr` (ministry Android backend; no Cloudflare). Dense ~22 km mesh + per-station backfill for all fuels; coverage gates refuse thin publishes.
 - **`scraper_ev.py`**: Queries the official Greek Ministry of Infrastructure & Transport (Μ.Υ.Φ.Α.Η.) OCPI 2.2 National Access Point (IDRO) static and dynamic feeds for 4,300+ EV charging hubs nationwide.
 - **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, packages EV chargers, and compresses with zstandard.
 - **GitHub Releases**: Publishes release tagged by date (e.g. `2026-09-17`) marked as `--latest`.
@@ -92,7 +92,7 @@ python package_dataset.py
 
 ## Windows Task Scheduler Automation
 
-Because Cloudflare WAF on `fuelgr.gr` actively challenges datacenter IP addresses (GitHub Actions runners), running the scraper locally on a Greek residential broadband connection (OTE, Vodafone, Nova) bypasses WAF challenges completely with HTTP 200 responses.
+Station prices are scraped from `deixto.gr` (no Cloudflare). Local Windows Task Scheduler remains the most reliable publisher path for long mesh+backfill runs and release uploads.
 
 The repository includes a turnkey Windows Task Scheduler integration that automates the entire scraping, packaging, and GitHub Releases publishing workflow with zero maintenance.
 

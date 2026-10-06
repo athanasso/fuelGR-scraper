@@ -63,15 +63,15 @@ jobs:
         continue-on-error: true
         run: node scraper.js
 
-      # fuelgr.gr often returns an HTML challenge to GitHub datacenter IPs;
-      # a cooldown + second try usually clears a transient throttle.
+      # deixto.gr can still flake (empty envelopes / brief outages).
+      # Coverage gates also fail the job when the scrape is too thin.
       - name: Retry station scraper after cooldown
         if: steps.stations.outcome == 'failure'
         id: stations_retry
         continue-on-error: true
         run: |
-          echo "First scrape failed (likely HTML/IP block). Waiting 30s..."
-          sleep 30
+          echo "First scrape failed (deixto flake or coverage gate). Waiting 60s..."
+          sleep 60
           node scraper.js
 
       - name: Fallback to existing stations dataset if scrape blocked
