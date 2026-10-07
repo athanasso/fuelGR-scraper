@@ -74,7 +74,7 @@ jobs:
           sleep 60
           node scraper.js
 
-      - name: Fallback 1: Government station listings with CoordinateMatcher
+      - name: "Fallback 1: Government station listings with CoordinateMatcher"
         if: steps.stations.outcome == 'failure' && steps.stations_retry.outcome == 'failure'
         id: fallback_stations
         continue-on-error: true
@@ -82,7 +82,7 @@ jobs:
           echo "::warning::Primary scraper failed. Running station-level fallback with CoordinateMatcher..."
           node fallback_scraper.js --stage=stations
 
-      - name: Fallback of the fallback: Official Ministry daily bulletins (fuelprices.mindev.gov.gr)
+      - name: "Fallback of the fallback: Official Ministry daily bulletins (fuelprices.mindev.gov.gr)"
         if: steps.stations.outcome == 'failure' && steps.stations_retry.outcome == 'failure' && (steps.fallback_stations.outcome == 'failure' || steps.fallback_stations.outcome == 'skipped')
         run: |
           echo "::warning::Station-level fallback unavailable. Executing fallback of the fallback (Ministry daily bulletins)..."
