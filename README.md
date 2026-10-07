@@ -1,6 +1,6 @@
 # fuelGR Scraper & Daily Dataset Pipeline
 
-Automated nationwide fuel price scraper and Google Reviews enrichment pipeline for Greece. Sourced from official Ministry of Development daily bulletins (fuelprices.gr) and the public web API.
+Automated nationwide fuel price scraper and Google Reviews enrichment pipeline for Greece. Sourced from deixto.gr mobile backend with automated dual fallback to the official Ministry of Development (fuelprices.mindev.gov.gr) and e-Katanalotis.
 
 Publishes minified JSON and zstandard-compressed (`.zst`) datasets directly to **GitHub Releases**, optimized for low-bandwidth consumption by mobile applications.
 
@@ -32,7 +32,10 @@ The repository uses three automated GitHub Actions workflows for maximum reliabi
 ### 1. Twice-Daily Fuel Prices & Release Builder ([`update-database.yml`](.github/workflows/update-database.yml))
 Scheduled **07:17 & 15:23 EEST** with backups **08:47 & 16:53** (GitHub cron often skips mornings; backups catch drops):
 - **`scraper.py`**: Fetches and parses government PDF bulletins for regional averages (Unleaded 95, 100, Diesel, LPG).
-- **`scraper.js`**: Queries 4,700+ stations nationwide via `deixto.gr` (ministry Android backend; no Cloudflare). Dense ~22 km mesh + per-station backfill for all fuels; coverage gates refuse thin publishes.
+- **`scraper.js`**: Primary nationwide station price scraper querying `deixto.gr` (fuelGR mobile backend; no Cloudflare). Dense ~22 km mesh + per-station backfill for all fuels; coverage gates refuse thin publishes.
+- **`fallback_scraper.js`**: Automatic dual fallback pipeline if primary `deixto.gr` is unreachable or fails coverage gates:
+  1. **Fallback 1 (e-Katanalotis / posokanei.gov.gr)**: Probes the government consumer price observatory API.
+  2. **Fallback 2 (fuelprices.mindev.gov.gr)**: Parses official Ministry of Development daily prefecture bulletins (PDF), normalizes all 54 Greek prefecture forms, and maps fresh benchmark prices across all 4,700+ verified station pins.
 - **`scraper_ev.py`**: Queries the official Greek Ministry of Infrastructure & Transport (Μ.Υ.Φ.Α.Η.) OCPI 2.2 National Access Point (IDRO) static and dynamic feeds for 4,300+ EV charging hubs nationwide.
 - **`package_dataset.py`**: Normalizes schema, accumulates daily ledger history, calculates 7-day price deltas & 14-day sparklines, embeds Google Reviews, packages EV chargers, and compresses with zstandard.
 - **GitHub Releases**: Publishes release tagged by date (e.g. `2026-09-17`) marked as `--latest`.
@@ -71,8 +74,12 @@ npx playwright install --with-deps chromium
 # Run prefecture averages scraper
 python scraper.py
 
-# Run station price scraper
+# Run station price scraper (primary deixto.gr backend)
 npm run scrape
+
+# Run emergency fallback scraper (e-Katanalotis & fuelprices.mindev.gov.gr)
+npm run scrape:fallback
+# or: node fallback_scraper.js
 
 # Run EV charging stations scraper (Greek Ministry OCPI feeds)
 npm run scrape:ev

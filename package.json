@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node scraper.js",
     "scrape": "node scraper.js",
+    "scrape:fallback": "node fallback_scraper.js",
     "scrape:reviews": "node reviews_scraper.js",
     "publish:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1",
     "publish:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -UploadOnly",

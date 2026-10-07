@@ -74,12 +74,11 @@ jobs:
           sleep 60
           node scraper.js
 
-      - name: Fallback to existing stations dataset if scrape blocked
+      - name: Fallback to e-Katanalotis and fuelprices.mindev.gov.gr if primary scraper fails
         if: steps.stations.outcome == 'failure' && steps.stations_retry.outcome == 'failure'
         run: |
-          echo "::warning::Station scraper blocked on both attempts. Restoring previous release stations dataset..."
-          mkdir -p data
-          curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/stations_latest.min.json" -o data/stations_latest.min.json || true
+          echo "::warning::Primary deixto scraper unavailable. Executing official government fallback pipeline..."
+          node fallback_scraper.js
 
       - name: Run EV charging stations scraper
         id: ev_chargers
