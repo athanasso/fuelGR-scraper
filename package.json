@@ -13,7 +13,9 @@
     "scrape:ev": "python scraper_ev.py",
     "publish:ev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./publish-local.ps1 -EVOnly",
     "tasks:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File ./setup-tasks.ps1",
-    "tasks:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File ./remove-tasks.ps1"
+    "tasks:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File ./remove-tasks.ps1",
+    "test:matcher": "node test_coordinate_matcher.js",
+    "test:fallback": "node fallback_scraper.js --stage=test"
   },
   "dependencies": {
     "playwright": "^1.40.0"

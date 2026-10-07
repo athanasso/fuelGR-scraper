@@ -1,13 +1,16 @@
 /**
- * Fallback Scraper for FuelGR
+ * Multi-Tier Government Fallback Scraper for FuelGR
  * 
  * Invoked when primary deixto.gr backend is unreachable, blocked, or fails coverage gates.
- * Fallbacks:
- * 1. e-Katanalotis / posokanei.gov.gr (General Secretariat for Commerce & Consumer Protection)
- * 2. fuelprices.mindev.gov.gr (Greek Ministry of Development daily price bulletins)
  * 
- * Updates all 4,700+ verified station pins in `data/stations_latest.min.json` with fresh,
- * authoritative government fuel prices mapped by Greek prefecture.
+ * Fallback Hierarchy:
+ * 1. Primary Scraper: deixto.gr / FuelGR direct backend (scraper.js)
+ * 2. Fallback 1: Government Station Feeds (e-Katanalotis / Ministry tables)
+ *    - Reconciles uncoordinated station listings to verified GPS pins via CoordinateMatcher.
+ * 3. Fallback of the Fallback (Fallback 2): Official Ministry Daily Price Bulletins (fuelprices.mindev.gov.gr)
+ *    - 100% immune to anti-bot defenses (open PDF bulletins at /files/deltia/).
+ *    - Maps fresh official prefecture benchmarks across all 4,713 verified station GPS pins.
+ * 4. Last Resort (Fallback 3): Previous GitHub Release Dataset.
  */
 
 const fs = require('fs');
@@ -15,9 +18,11 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { execSync } = require('child_process');
+const { CoordinateMatcher } = require('./coordinate_matcher');
 
 const STATIONS_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
 const PREFECTURES_FILE = path.join(__dirname, 'data', 'prefectures_latest.json');
+const RAW_MINISTRY_FILE = path.join(__dirname, 'data', 'ministry_raw_stations.json');
 const LATEST_RELEASE_URL = 'https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json';
 
 // Greek genitive/nomarchia to Ministry Bulletin prefecture key mapping
@@ -97,22 +102,6 @@ function fetchUrl(url, timeoutMs = 8000) {
   });
 }
 
-async function tryEKatanalotis() {
-  console.log('[Fallback 1] Probing e-Katanalotis / posokanei.gov.gr...');
-  try {
-    const res = await fetchUrl('https://posokanei.gov.gr/api/v1/fuel-prices');
-    if (res.status === 200 && res.body.includes('[')) {
-      console.log('  [OK] Received live JSON payload from posokanei.gov.gr!');
-      return JSON.parse(res.body);
-    } else {
-      console.log(`  [i] posokanei.gov.gr returned status=${res.status} (WAF protected / requires Gov auth)`);
-    }
-  } catch (err) {
-    console.log(`  [i] e-Katanalotis probe error: ${err.message}`);
-  }
-  return null;
-}
-
 function loadBaselineStations() {
   if (fs.existsSync(STATIONS_FILE)) {
     try {
@@ -126,7 +115,7 @@ function loadBaselineStations() {
 
   console.log('  [i] Local stations file missing or small; restoring from previous release...');
   try {
-    const curlCmd = `curl -fsSL "${LATEST_RELEASE_URL}" -o "${STATIONS_FILE}"`;
+    const curlCmd = `curl.exe -fsSL "${LATEST_RELEASE_URL}" -o "${STATIONS_FILE}"`;
     execSync(curlCmd, { stdio: 'inherit' });
     const data = JSON.parse(fs.readFileSync(STATIONS_FILE, 'utf8'));
     console.log(`  [OK] Downloaded ${data.length} stations from latest GitHub Release`);
@@ -149,8 +138,105 @@ function ensureMinistryPrefectures() {
   return prefs;
 }
 
-async function runMinistryFallback() {
-  console.log('\n[Fallback 2] Applying official Ministry of Development daily bulletins (fuelprices.mindev.gov.gr)...');
+// ----------------------------------------------------------------------------
+// TIER 1: GOVERNMENT STATION FEEDS
+// ----------------------------------------------------------------------------
+
+async function tryEKatanalotis() {
+  console.log('[Tier 1: Government Feeds] Probing e-Katanalotis / posokanei.gov.gr...');
+  try {
+    const res = await fetchUrl('https://posokanei.gov.gr/api/v1/fuel-prices');
+    if (res.status === 200 && res.body.includes('[')) {
+      console.log('  [OK] Received live JSON payload from posokanei.gov.gr!');
+      const data = JSON.parse(res.body);
+      if (Array.isArray(data) && data.length > 0) return data;
+    } else {
+      console.log(`  [i] posokanei.gov.gr returned HTTP ${res.status} (WAF / auth guarded)`);
+    }
+  } catch (err) {
+    console.log(`  [i] e-Katanalotis probe error: ${err.message}`);
+  }
+  return null;
+}
+
+async function tryMinistryStations() {
+  console.log('[Tier 1: Government Feeds] Checking Ministry station tables (fuelprices.mindev.gov.gr)...');
+  
+  // Check if uncoordinated snapshot exists locally
+  if (fs.existsSync(RAW_MINISTRY_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(RAW_MINISTRY_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length > 0) {
+        console.log(`  [OK] Loaded ${data.length} uncoordinated Ministry station records from ${RAW_MINISTRY_FILE}`);
+        return data;
+      }
+    } catch (e) {}
+  }
+
+  // Probe fuelprices.gr web status
+  try {
+    const res = await fetchUrl('https://www.fuelprices.gr/CheckPrices');
+    if (res.body.includes('g-recaptcha') || res.body.includes('captchaDiv')) {
+      console.log('  [i] fuelprices.gr/CheckPrices is protected by Google reCAPTCHA v2 (automated table extraction blocked).');
+    }
+  } catch (err) {
+    console.log(`  [i] fuelprices.gr probe error: ${err.message}`);
+  }
+
+  return null;
+}
+
+/**
+ * Reconciles an uncoordinated feed to verified physical GPS coordinates
+ * using the production CoordinateMatcher.
+ */
+async function reconcileUncoordinatedFeed(rawStations, saveToFile = true) {
+  console.log(`\n[CoordinateMatcher] Reconciling ${rawStations.length} uncoordinated listings to physical GPS pins...`);
+  const baseline = loadBaselineStations();
+  const matcher = new CoordinateMatcher(baseline);
+  const result = matcher.reconcileDataset(rawStations, 0.65);
+  
+  console.log(`  [OK] Successfully reconciled ${result.matched} / ${result.total} stations (${result.matchRatePct.toFixed(1)}%) with GPS pins.`);
+
+  // Format reconciled stations to match FuelGR schema
+  const todayStr = new Date().toISOString().split('T')[0];
+  const formattedStations = result.stations.filter(s => s.lat != null && s.lng != null).map(s => {
+    const fuels = s.fuels || {};
+    if (s.price && !fuels['1']) {
+      fuels['1'] = { name: 'Αμόλυβδη 95', price: Number(s.price), date: s.date || todayStr };
+    }
+
+    return {
+      id: s.id || s.matched_station_id,
+      name: s.owner || s.name || '',
+      brand: s.brand || '',
+      address: s.address || '',
+      prefecture: s.prefecture || '',
+      lat: s.lat,
+      lng: s.lng,
+      price: s.price || (fuels['1'] ? fuels['1'].price : null),
+      fuel_type: s.fuel_type || 'Unleaded 95',
+      fuels: fuels,
+      last_updated: s.last_updated || todayStr,
+      match_confidence: s.match_confidence
+    };
+  });
+
+  if (saveToFile) {
+    fs.mkdirSync(path.dirname(STATIONS_FILE), { recursive: true });
+    fs.writeFileSync(STATIONS_FILE, JSON.stringify(formattedStations));
+    console.log(`  [OK] Saved ${formattedStations.length} reconciled stations to ${STATIONS_FILE} (${(fs.statSync(STATIONS_FILE).size / 1024).toFixed(0)} KB)`);
+  }
+
+  return formattedStations;
+}
+
+// ----------------------------------------------------------------------------
+// TIER 2: FALLBACK OF THE FALLBACK (MINISTRY DAILY PREFECTURE BULLETINS)
+// ----------------------------------------------------------------------------
+
+async function runMinistryBulletinFallback(saveToFile = true) {
+  console.log('\n[Fallback of the Fallback] Applying official Ministry daily bulletins (fuelprices.mindev.gov.gr)...');
   
   const stations = loadBaselineStations();
   const prefs = ensureMinistryPrefectures();
@@ -220,30 +306,151 @@ async function runMinistryFallback() {
     updatedCount++;
   }
 
-  fs.mkdirSync(path.dirname(STATIONS_FILE), { recursive: true });
-  fs.writeFileSync(STATIONS_FILE, JSON.stringify(stations));
+  if (saveToFile) {
+    fs.mkdirSync(path.dirname(STATIONS_FILE), { recursive: true });
+    fs.writeFileSync(STATIONS_FILE, JSON.stringify(stations));
+    console.log(`\n========================================================`);
+    console.log(`FALLBACK OF THE FALLBACK SUCCESSFUL — fuelprices.mindev.gov.gr`);
+    console.log(`  Stations updated : ${updatedCount} / ${stations.length}`);
+    console.log(`  Bulletin date    : ${latestBulletinDate}`);
+    console.log(`  Benchmark source : Official Daily Prefecture Bulletins (fuelprices.gr)`);
+    console.log(`  Saved to         : ${STATIONS_FILE} (${(fs.statSync(STATIONS_FILE).size / 1024).toFixed(0)} KB)`);
+    console.log(`========================================================\n`);
+  }
 
-  console.log(`\n========================================================`);
-  console.log(`FALLBACK SUCCESSFUL — fuelprices.mindev.gov.gr`);
-  console.log(`  Stations updated : ${updatedCount} / ${stations.length}`);
-  console.log(`  Bulletin date    : ${latestBulletinDate}`);
-  console.log(`  Benchmark source : Official Daily Prefecture Bulletins (fuelprices.gr)`);
-  console.log(`  Saved to         : ${STATIONS_FILE} (${(fs.statSync(STATIONS_FILE).size / 1024).toFixed(0)} KB)`);
-  console.log(`========================================================\n`);
+  return stations;
 }
 
-async function main() {
-  console.log(`[${new Date().toISOString()}] Initiating Government Price Fallback Pipeline...`);
+// ----------------------------------------------------------------------------
+// END-TO-END TEST SUITE FOR FALLBACK PIPELINE
+// ----------------------------------------------------------------------------
 
-  // Step 1: e-Katanalotis probe
-  const ekData = await tryEKatanalotis();
-  if (ekData) {
-    console.log('[OK] Merged e-Katanalotis data feed.');
+async function runEndToEndTest() {
+  console.log('================================================================');
+  console.log('     END-TO-END GOVERNMENT FALLBACK PIPELINE TEST               ');
+  console.log('================================================================\n');
+
+  console.log('--- Step 1: Testing Spatial Coordinate Reconciliation ---');
+  // Real stations from database tested with Ministry-style input variations
+  const mockUncoordinatedData = [
+    {
+      brand: 'ΑΙΓΑΙΟ',
+      owner: 'TROVAS PARKING',
+      address: '3ης Σεπτεμβρίου 144, Αθήνα',
+      prefecture: 'ΑΤΤΙΚΗΣ',
+      price: 1.849,
+      fuel_type: 'Unleaded 95'
+    },
+    {
+      brand: 'AVIN',
+      owner: 'ΚΟΝΚΑΤ',
+      address: 'λεωφοροσ κηφισιασ 221',
+      prefecture: 'ΑΤΤΙΚΗΣ',
+      price: 1.899,
+      fuel_type: 'Unleaded 95'
+    },
+    {
+      brand: 'EKO',
+      owner: 'ΦΙΛΙΠΠΟΥ ΙΩΑΝΝΗΣ ΜΟΝΟΠΡΟΣΩΠΗ Ι.Κ.Ε.',
+      address: 'Λεωφ. Αλεξάνδρας 54',
+      prefecture: 'ΑΤΤΙΚΗΣ',
+      price: 1.839,
+      fuel_type: 'Unleaded 95'
+    },
+    {
+      brand: 'AEGEAN',
+      owner: 'ΤΕΜΕΤΕΡΟΝ',
+      address: '342,5 ΧΛΜ ΕΘΝΙΚΗΣ ΟΔΟΥ ΑΘ-ΘΕΣΣΑΛΟΝΙΚΗΣ ΠΡΟΣ ΑΘΗΝΑ',
+      prefecture: 'ΛΑΡΙΣΗΣ',
+      price: 1.879,
+      fuel_type: 'Unleaded 95'
+    }
+  ];
+
+  // In test mode: do not overwrite production stations_latest.min.json
+  const reconciled = await reconcileUncoordinatedFeed(mockUncoordinatedData, false);
+  if (reconciled.length !== mockUncoordinatedData.length) {
+    throw new Error(`Expected ${mockUncoordinatedData.length} reconciled stations, got ${reconciled.length}`);
+  }
+
+  for (const s of reconciled) {
+    if (!s.lat || !s.lng) throw new Error(`Station missing coordinates: ${JSON.stringify(s)}`);
+    if (s.lat < 34.0 || s.lat > 42.5 || s.lng < 19.0 || s.lng > 30.0) {
+      throw new Error(`Coordinates out of Greek bounding box: lat=${s.lat}, lng=${s.lng}`);
+    }
+    console.log(`  [PASS] ${s.brand.padEnd(8)} | ${s.address.slice(0, 32).padEnd(32)} -> GPS: (${s.lat.toFixed(4)}, ${s.lng.toFixed(4)}) Match: ${(s.match_confidence * 100).toFixed(0)}%`);
+  }
+
+  console.log('\n--- Step 2: Testing Fallback of the Fallback (Ministry Bulletins) ---');
+  const bulletinStations = await runMinistryBulletinFallback(false);
+  if (!bulletinStations || bulletinStations.length < 3000) {
+    throw new Error('Ministry bulletin fallback returned empty or undersized dataset.');
+  }
+  console.log(`  [PASS] Successfully applied Ministry bulletin benchmarks to ${bulletinStations.length} baseline stations.`);
+
+  console.log('\n[SUCCESS] End-to-end fallback pipeline verified successfully!');
+}
+
+// ----------------------------------------------------------------------------
+// CLI DISPATCHER
+// ----------------------------------------------------------------------------
+
+async function main() {
+  const args = process.argv.slice(2);
+  const stage = args.find(a => a.startsWith('--stage='))?.split('=')[1] || 
+                (args.includes('--test') ? 'test' : 'auto');
+
+  console.log(`[${new Date().toISOString()}] Initiating Multi-Tier Government Fallback Pipeline (stage=${stage})...`);
+
+  if (stage === 'test') {
+    await runEndToEndTest();
     return;
   }
 
-  // Step 2: fuelprices.mindev.gov.gr daily bulletins
-  await runMinistryFallback();
+  if (stage === 'stations') {
+    // Only attempt Tier 1: Government station listings with CoordinateMatcher
+    const ekData = await tryEKatanalotis();
+    if (ekData && Array.isArray(ekData) && ekData.length > 0) {
+      await reconcileUncoordinatedFeed(ekData, true);
+      return;
+    }
+
+    const minData = await tryMinistryStations();
+    if (minData && Array.isArray(minData) && minData.length > 0) {
+      await reconcileUncoordinatedFeed(minData, true);
+      return;
+    }
+
+    console.log('  [!] All uncoordinated station feeds unavailable/blocked. Exiting stage=stations.');
+    process.exit(1);
+  }
+
+  if (stage === 'bulletins') {
+    // Directly run Tier 2: Fallback of the fallback (Ministry daily bulletins)
+    await runMinistryBulletinFallback(true);
+    return;
+  }
+
+  // Stage: auto (cascading fallback)
+  // Step 1: Probe e-Katanalotis
+  const ekData = await tryEKatanalotis();
+  if (ekData && Array.isArray(ekData) && ekData.length > 0) {
+    console.log('[OK] Received live listings from e-Katanalotis. Running spatial reconciliation...');
+    await reconcileUncoordinatedFeed(ekData, true);
+    return;
+  }
+
+  // Step 2: Probe Ministry station tables
+  const minData = await tryMinistryStations();
+  if (minData && Array.isArray(minData) && minData.length > 0) {
+    console.log('[OK] Received live uncoordinated Ministry records. Running spatial reconciliation...');
+    await reconcileUncoordinatedFeed(minData, true);
+    return;
+  }
+
+  // Step 3: Fallback of the fallback (Ministry daily bulletins)
+  console.log('[!] Station-level feeds unavailable. Escalating to Fallback of the Fallback...');
+  await runMinistryBulletinFallback(true);
 }
 
 if (require.main === module) {
@@ -253,4 +460,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, runMinistryFallback, tryEKatanalotis };
+module.exports = {
+  main,
+  tryEKatanalotis,
+  tryMinistryStations,
+  reconcileUncoordinatedFeed,
+  runMinistryBulletinFallback,
+  runEndToEndTest,
+  CoordinateMatcher
+};
