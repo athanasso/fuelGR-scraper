@@ -2,12 +2,8 @@ name: Twice-Daily Google Reviews Enrichment
 
 on:
   schedule:
-    # ~2h after prices primaries; backup ~90m later for GH morning drops.
-    # Athens summer (UTC+3): 09:19 / 10:49 and 17:27 / 18:57
-    - cron: '19 6 * * *'
-    - cron: '49 7 * * *'
-    - cron: '27 14 * * *'
-    - cron: '57 15 * * *'
+    # Weekly run: Sunday 06:19 UTC (Athens summer UTC+3: 09:19)
+    - cron: '19 6 * * 0'
   workflow_dispatch:
     inputs:
       delay_min:
