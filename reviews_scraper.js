@@ -36,6 +36,7 @@ const CONCURRENCY  = parseInt(getArg('--concurrency', '1'), 10);
 const DELAY_MIN    = parseInt(getArg('--delay-min', '3000'), 10);
 const DELAY_MAX    = parseInt(getArg('--delay-max', '6000'), 10);
 const MAX_TIME_MIN = parseInt(getArg('--max-time-min', isCI ? '150' : '0'), 10);
+const STATION_TIMEOUT_MS = parseInt(getArg('--station-timeout-ms', '120000'), 10);
 const REFRESH_DAYS = parseInt(getArg('--refresh-days', '14'), 10); // -1 = force all, 0 = never
 const SHARD        = parseInt(getArg('--shard', '0'), 10);
 const TOTAL_SHARDS = parseInt(getArg('--total-shards', '1'), 10);
@@ -690,22 +691,26 @@ async function fetchGoogleReviews(page, station, state) {
 
 // ── Worker ─────────────────────────────────────────────────────────────────────
 async function workerLoop(browser, queue, results, done, startTime, maxDurationMs) {
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'el-GR',
-    timezoneId: 'Europe/Athens',
-    viewport: { width: 1280, height: 800 }
-  });
-  const page = await context.newPage();
+  const createWorkerPage = async () => {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'el-GR',
+      timezoneId: 'Europe/Athens',
+      viewport: { width: 1280, height: 800 }
+    });
+    const page = await context.newPage();
+    // Skip heavy assets — we only need DOM text for rating/count
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (type === 'image' || type === 'media' || type === 'font') {
+        return route.abort();
+      }
+      return route.continue();
+    });
+    return { context, page };
+  };
 
-  // Skip heavy assets — we only need DOM text for rating/count
-  await page.route('**/*', (route) => {
-    const type = route.request().resourceType();
-    if (type === 'image' || type === 'media' || type === 'font') {
-      return route.abort();
-    }
-    return route.continue();
-  });
+  let { context, page } = await createWorkerPage();
 
   const state = { consentDone: false };
 
@@ -727,7 +732,19 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
     process.stdout.write(`[${done.count + 1}] ${brand ? brand + ' ' : ''}${name} (${id})... `);
 
     const hadPrior = Boolean(results[id]);
-    const result = await fetchGoogleReviews(page, station, state);
+    const fetchPromise = fetchGoogleReviews(page, station, state).catch(() => ({ rating: null, reviews: null }));
+    const timeoutPromise = sleep(STATION_TIMEOUT_MS).then(() => ({ rating: null, reviews: null, timedOut: true }));
+    const result = await Promise.race([fetchPromise, timeoutPromise]);
+    if (result.timedOut) {
+      console.log(`n/a (timed out after ${Math.round(STATION_TIMEOUT_MS / 1000)}s)`);
+      state.consentDone = false;
+      try { await context.close(); } catch {}
+      ({ context, page } = await createWorkerPage());
+      done.count++;
+      if (done.count % 10 === 0) saveReviews(results);
+      await jitter(DELAY_MIN, DELAY_MAX);
+      continue;
+    }
     if (result.blocked) {
       queue.length = 0; // stop remaining requests gracefully
       break;
