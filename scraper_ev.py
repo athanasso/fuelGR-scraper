@@ -37,8 +37,16 @@ DIST_DIR = BASE_DIR / "dist"
 STATIC_ZIP_URL = "https://electrokinisi.yme.gov.gr/public/static_files/GR.IDRO.static.data.latest.json.zip"
 DYNAMIC_ZIP_URL = "https://electrokinisi.yme.gov.gr/public/static_files/GR.IDRO.dynamic.data.latest.json.zip"
 RELEASE_CHARGERS_URL = "https://github.com/athanasso/fuelGR-scraper/releases/latest/download/chargers_latest.min.json"
+EV_PRICES_URL = "https://map.evpriceplanner.com/api/locations"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+EV_PRICES_HEADERS = {
+    "Referer": "https://map.evpriceplanner.com/",
+    "Origin": "https://map.evpriceplanner.com",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
 
 # Curated fallback Greek hubs if all remote sources are unreachable
 CURATED_FALLBACK = [
@@ -100,11 +108,19 @@ CURATED_FALLBACK = [
 ]
 
 
-def download_with_retry(url: str, max_retries: int = 3, timeout: int = 40) -> bytes | None:
+def download_with_retry(
+    url: str,
+    max_retries: int = 3,
+    timeout: int = 40,
+    headers: dict | None = None,
+) -> bytes | None:
     """Download binary data with user-agent, retry backoff and timeout."""
+    req_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        req_headers.update(headers)
     for attempt in range(1, max_retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers=req_headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     return resp.read()
@@ -113,6 +129,36 @@ def download_with_retry(url: str, max_retries: int = 3, timeout: int = 40) -> by
             if attempt < max_retries:
                 time.sleep(3 * attempt)
     return None
+
+
+def fetch_live_tariffs() -> dict[str, dict]:
+    """Fetch live tariffs and statuses from EV Price Planner API."""
+    print("  Fetching live pricing dataset from EV Price Planner...")
+    raw = download_with_retry(EV_PRICES_URL, max_retries=2, timeout=25, headers=EV_PRICES_HEADERS)
+    if not raw:
+        print("  [!] EV Price Planner live price feed unreachable. Falling back to heuristic tariffs.")
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        features = data.get("features", [])
+        prices: dict[str, dict] = {}
+        for feat in features:
+            props = feat.get("properties") or {}
+            lid = props.get("location_id")
+            if not lid:
+                continue
+            prices[lid] = {
+                "price_min": props.get("price_min"),
+                "price_min_ac": props.get("price_min_ac"),
+                "price_min_dc": props.get("price_min_dc"),
+                "status_now": props.get("status_now"),
+                "access_level": props.get("access_level"),
+            }
+        print(f"  Loaded live tariffs for {len(prices):,} EV charging locations.")
+        return prices
+    except Exception as e:
+        print(f"  [!] Failed to parse EV Price Planner data: {e}")
+        return {}
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -285,6 +331,9 @@ def scrape_ev_chargers() -> list[dict]:
     else:
         print("  [!] Dynamic feed unavailable; falling back to static status.")
 
+    # 3. Download Live Tariffs
+    live_tariffs = fetch_live_tariffs()
+
     raw_locs = static_json.get("Locations", [])
     print(f"  Processing {len(raw_locs):,} raw EV locations...")
 
@@ -316,6 +365,7 @@ def scrape_ev_chargers() -> list[dict]:
         pref = (loc.get("state") or "").strip()
 
         op_name, op_key = map_operator(loc.get("party_id"), loc.get("operator"))
+        price_info = live_tariffs.get(loc_id)
 
         raw_conns: list[dict] = []
         max_power = 0.0
@@ -372,7 +422,19 @@ def scrape_ev_chargers() -> list[dict]:
             else:
                 st = "unknown"
 
-            tariff = get_default_tariff(op_key, ccurr, power_kw)
+            # Prioritize live tariff from EV Price Planner
+            tariff = None
+            if price_info:
+                if ccurr == "AC" and price_info.get("price_min_ac") is not None:
+                    tariff = round(float(price_info["price_min_ac"]), 3)
+                elif ccurr == "DC" and price_info.get("price_min_dc") is not None:
+                    tariff = round(float(price_info["price_min_dc"]), 3)
+                elif price_info.get("price_min") is not None:
+                    tariff = round(float(price_info["price_min"]), 3)
+
+            # Heuristic fallback if not in live feed
+            if tariff is None:
+                tariff = get_default_tariff(op_key, ccurr, power_kw)
 
             connectors.append({
                 "id": f"c{idx}",
@@ -396,7 +458,12 @@ def scrape_ev_chargers() -> list[dict]:
         else:
             status_summary = "unknown"
 
-        tariff_from = min((c["tariffKwh"] for c in connectors if c["tariffKwh"] is not None), default=None)
+        if price_info and price_info.get("price_min") is not None:
+            tariff_from = round(float(price_info["price_min"]), 3)
+        else:
+            tariff_from = min((c["tariffKwh"] for c in connectors if c["tariffKwh"] is not None), default=None)
+
+        is_free = (tariff_from == 0.0)
 
         charger_item: dict = {
             "id": loc_id,
@@ -411,6 +478,8 @@ def scrape_ev_chargers() -> list[dict]:
             "statusSummary": status_summary,
             "tariffFromKwh": tariff_from,
         }
+        if is_free:
+            charger_item["isFree"] = True
         if city:
             charger_item["city"] = city
         if pref and len(pref) < 40 and not pref.lower().startswith("good"):
