@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 scraper_ev.py
 
@@ -492,6 +492,8 @@ def scrape_ev_chargers() -> list[dict]:
         # Cross-reference nearby petrol stations (co-located within 45 meters)
         if gas_stations:
             for gs in gas_stations:
+                if abs(lat - gs["lat"]) > 0.001 or abs(lng - gs["lng"]) > 0.001:
+                    continue
                 d_km = haversine_km(lat, lng, gs["lat"], gs["lng"])
                 if d_km <= 0.045:  # <= 45 meters
                     charger_item["linkedStationId"] = gs["id"]
