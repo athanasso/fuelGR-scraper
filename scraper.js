@@ -125,6 +125,7 @@ function parseXmlStations(xml) {
     const br = (body.match(/<br[^>]*>([^<]+)<\/br>/) || [])[1] || 'Ανεξάρτητο';
     const ad = (body.match(/<ad>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ad>/) || [])[1] || '';
     const ow = (body.match(/<ow>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ow>/) || [])[1] || '';
+    const is24h = /<feat[^>]*\bh24=["']?1["']?/.test(body) || /\bh24=["']?1["']?/.test(attrs);
 
     const fuels = {};
     const ftMatches = body.matchAll(/<ft\s([^>]+)>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/ft>/g);
