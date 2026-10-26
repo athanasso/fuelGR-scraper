@@ -115,7 +115,8 @@ function loadBaselineStations() {
 
   console.log('  [i] Local stations file missing or small; restoring from previous release...');
   try {
-    const curlCmd = `curl.exe -fsSL "${LATEST_RELEASE_URL}" -o "${STATIONS_FILE}"`;
+    const curlBin = process.platform === "win32" ? "curl.exe" : "curl";
+    const curlCmd = `${curlBin} -fsSL "${LATEST_RELEASE_URL}" -o "${STATIONS_FILE}"`;
     execSync(curlCmd, { stdio: 'inherit' });
     const data = JSON.parse(fs.readFileSync(STATIONS_FILE, 'utf8'));
     console.log(`  [OK] Downloaded ${data.length} stations from latest GitHub Release`);
