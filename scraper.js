@@ -195,6 +195,7 @@ function parseXmlStations(xml) {
         fuel: primaryFuel,
         price: primaryPrice,
         fuels,
+        h24: is24h ? 1 : 0,
         last_updated: latestDate || new Date().toISOString().split('T')[0]
       });
     }
@@ -270,6 +271,7 @@ function mergeStation(base, incoming) {
   if (incoming.name && incoming.name !== 'Πρατήριο Καυσίμων') merged.name = incoming.name;
   if (incoming.prefecture) merged.prefecture = incoming.prefecture;
   if (incoming.municipality) merged.municipality = incoming.municipality;
+  if (incoming.h24 !== undefined) merged.h24 = incoming.h24;
   return merged;
 }
 

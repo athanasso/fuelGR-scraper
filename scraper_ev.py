@@ -289,6 +289,44 @@ def load_gas_stations_for_linking(data_dir: Path) -> list[dict]:
     return []
 
 
+
+def parse_opening_times(opening_times: dict | None, parking_type: str | None) -> tuple[bool, str | None]:
+    """Parse OCPI opening_times into (twentyFourSeven, human_readable_hours)."""
+    if not opening_times:
+        return True, "24/7"
+    if opening_times.get("twentyfourseven") is True:
+        return True, "24/7"
+    regular = opening_times.get("regular_hours") or []
+    if not regular:
+        return False, None
+    day_abbr = {1: "Δευ", 2: "Τρι", 3: "Τετ", 4: "Πεμ", 5: "Παρ", 6: "Σαβ", 7: "Κυρ"}
+    hours_to_days: dict[str, list[int]] = {}
+    for entry in regular:
+        wd = entry.get("weekday")
+        b = entry.get("period_begin", "")
+        e = entry.get("period_end", "")
+        if wd and b and e:
+            t_str = f"{b}-{e}"
+            hours_to_days.setdefault(t_str, []).append(wd)
+    if not hours_to_days:
+        return False, None
+    parts = []
+    for t_str, days in hours_to_days.items():
+        days.sort()
+        if len(days) == 7:
+            d_str = "Καθημερινά"
+        elif days == [1, 2, 3, 4, 5]:
+            d_str = "Δευ-Παρ"
+        elif days == [1, 2, 3, 4, 5, 6]:
+            d_str = "Δευ-Σαβ"
+        elif days == [6, 7]:
+            d_str = "Σαβ-Κυρ"
+        else:
+            d_str = ",".join(day_abbr.get(d, str(d)) for d in days)
+        parts.append(f"{d_str} {t_str}")
+    return False, " • ".join(parts)
+
+
 def scrape_ev_chargers() -> list[dict]:
     """Download official IDRO static + dynamic feeds, normalize, and return EVCharger list."""
     print("==> Downloading official Greek EV Registry (MYFAH) feeds...")
@@ -366,6 +404,7 @@ def scrape_ev_chargers() -> list[dict]:
 
         op_name, op_key = map_operator(loc.get("party_id"), loc.get("operator"))
         price_info = live_tariffs.get(loc_id)
+        is_24_7, hours_str = parse_opening_times(loc.get("opening_times"), loc.get("parking_type"))
 
         raw_conns: list[dict] = []
         max_power = 0.0
@@ -477,6 +516,9 @@ def scrape_ev_chargers() -> list[dict]:
             "connectors": connectors,
             "statusSummary": status_summary,
             "tariffFromKwh": tariff_from,
+            "twentyFourSeven": is_24_7,
+            "openingHours": hours_str,
+            "parkingType": loc.get("parking_type"),
         }
         if is_free:
             charger_item["isFree"] = True

@@ -584,6 +584,8 @@ def build_master_and_history(
         "sp": sparklines,
         "dt": last_updated if isinstance(last_updated, str) else today,
     }
+    if raw.get("h24") == 1 or raw.get("h24") == "1":
+        master_item["h24"] = 1
     if reviews and st_id in reviews:
         rev = reviews[st_id]
         if isinstance(rev, dict):
