@@ -10,3 +10,4 @@ data/
 .playwright/
 logs/
 *.log
+.github/context-mode/

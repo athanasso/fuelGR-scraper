@@ -40,6 +40,7 @@ const STATION_TIMEOUT_MS = parseInt(getArg('--station-timeout-ms', '120000'), 10
 const REFRESH_DAYS = parseInt(getArg('--refresh-days', '14'), 10); // -1 = force all, 0 = never
 const SHARD        = parseInt(getArg('--shard', '0'), 10);
 const TOTAL_SHARDS = parseInt(getArg('--total-shards', '1'), 10);
+const TARGET_STATION_ID = getArg('--station-id', null);
 const INPUT_FILE   = getArg('--input', path.join(__dirname, 'data', 'stations_latest.min.json'));
 const defaultOutput = TOTAL_SHARDS > 1
   ? path.join(__dirname, 'data', `reviews_shard_${SHARD}.json`)
@@ -452,7 +453,7 @@ function titleMatchesStation(title, station, subtitle = '', category = '') {
  * Among nearby duplicate listings (e.g. ARGY OIL vs Aegean with LPG), pick the
  * pin closest to the fuelgr station coordinates — not the first name match.
  */
-async function fetchGoogleReviews(page, station, state) {
+async function fetchGoogleReviews(page, station, state, prior = null) {
   const brandRaw = (station.brand || station.b || '').trim();
   const name = (station.name || station.n || '').trim();
   const address = (station.address || station.a || '').trim();
@@ -467,6 +468,15 @@ async function fetchGoogleReviews(page, station, state) {
     const q = parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
     if (q && !queries.includes(q)) queries.push(q);
   };
+
+  // Direct verified place link on refresh (fastest, most accurate)
+  if (prior && hasValidMapsLink(prior) && prior.mu) {
+    let direct = prior.mu;
+    if (!direct.includes('gl=')) {
+      direct += (direct.includes('?') ? '&' : '?') + 'gl=us&hl=el';
+    }
+    queries.push({ url: direct, isDirect: true });
+  }
 
   // Coord-anchored searches first — Maps ranks nearby pins; we then pick closest
   if (hasCoords) {
@@ -490,7 +500,11 @@ async function fetchGoogleReviews(page, station, state) {
     const exactEnoughM = 35;
 
     for (let qi = 0; qi < Math.min(queries.length, 4); qi++) {
-      const url = `https://www.google.com/maps/search/${encodeURIComponent(queries[qi])}`;
+      const qItem = queries[qi];
+      const isDirect = typeof qItem === 'object' && qItem.isDirect;
+      const url = isDirect
+        ? qItem.url
+        : `https://www.google.com/maps/search/${encodeURIComponent(qItem)}?gl=us&hl=el`;
 
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
@@ -499,13 +513,16 @@ async function fetchGoogleReviews(page, station, state) {
         return { rating: null, reviews: null, blocked: true };
       }
 
-      if (!state.consentDone) {
+      if (!state.consentDone || page.url().includes('consent.google.com')) {
         try {
           const consentBtn = await page.$(
             'button:has-text("Αποδοχή όλων"), button:has-text("Accept all"), form[action*="consent"] button'
           );
           if (consentBtn) {
-            await consentBtn.click();
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+              consentBtn.click()
+            ]);
             await page.waitForTimeout(800);
             state.consentDone = true;
           }
@@ -516,7 +533,7 @@ async function fetchGoogleReviews(page, station, state) {
         .waitForSelector('div.F7nice, div.Nv2PK, [role="article"]', { timeout: 2800 })
         .catch(() => {});
 
-      if (!page.url().includes('/place/')) {
+      if (!isDirect && !page.url().includes('/place/')) {
         // Pick the closest fuel-looking card to the station pin (href often has @lat,lng)
         const targetName = [name, brand, address].filter(Boolean).join(' ');
         const streetNum = addressNumber(address);
@@ -603,7 +620,10 @@ async function fetchGoogleReviews(page, station, state) {
       }
 
       const result = await page.evaluate(extractRatingFromPage);
-      const matched = titleMatchesStation(
+      if (result.rating !== null && (result.reviews === null || result.reviews <= 0) && prior?.reviews) {
+        result.reviews = prior.reviews;
+      }
+      const matched = isDirect || titleMatchesStation(
         result.title || '',
         station,
         result.subtitle || '',
@@ -732,7 +752,8 @@ async function workerLoop(browser, queue, results, done, startTime, maxDurationM
     process.stdout.write(`[${done.count + 1}] ${brand ? brand + ' ' : ''}${name} (${id})... `);
 
     const hadPrior = Boolean(results[id]);
-    const fetchPromise = fetchGoogleReviews(page, station, state).catch(() => ({ rating: null, reviews: null }));
+    const prior = results[id] || null;
+    const fetchPromise = fetchGoogleReviews(page, station, state, prior).catch(() => ({ rating: null, reviews: null }));
     const timeoutPromise = sleep(STATION_TIMEOUT_MS).then(() => ({ rating: null, reviews: null, timedOut: true }));
     const result = await Promise.race([fetchPromise, timeoutPromise]);
     if (result.timedOut) {
@@ -862,6 +883,11 @@ async function main() {
 
   // Fix coord-fallback links first (user-visible), then gaps, then stale ratings
   let queue = [...missingLink, ...missing, ...stale];
+
+  if (TARGET_STATION_ID) {
+    queue = stations.filter((s) => String(s.id) === String(TARGET_STATION_ID));
+    console.log(`[Target] Focusing exclusively on station ID ${TARGET_STATION_ID} (${queue.length} match).`);
+  }
 
   // Stable id-based sharding so the same station always lands on the same runner
   if (TOTAL_SHARDS > 1) {
