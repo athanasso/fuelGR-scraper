@@ -21,6 +21,7 @@ const { execSync } = require('child_process');
 const { CoordinateMatcher } = require('./coordinate_matcher');
 
 const STATIONS_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
+const SEED_FILE = path.join(__dirname, 'stations_seed.json');
 const PREFECTURES_FILE = path.join(__dirname, 'data', 'prefectures_latest.json');
 const RAW_MINISTRY_FILE = path.join(__dirname, 'data', 'ministry_raw_stations.json');
 const LATEST_RELEASE_URL = 'https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json';
@@ -108,6 +109,16 @@ function loadBaselineStations() {
       const data = JSON.parse(fs.readFileSync(STATIONS_FILE, 'utf8'));
       if (Array.isArray(data) && data.length >= 3000) {
         console.log(`  [OK] Loaded ${data.length} stations from local ${STATIONS_FILE}`);
+        return data;
+      }
+    } catch (e) {}
+  }
+
+  if (fs.existsSync(SEED_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length >= 3000) {
+        console.log(`  [OK] Loaded ${data.length} stations from seed file ${SEED_FILE}`);
         return data;
       }
     } catch (e) {}

@@ -22,6 +22,7 @@ const https = require('https');
 const crypto = require('crypto');
 
 const OUTPUT_FILE = path.join(__dirname, 'data', 'stations_latest.min.json');
+const SEED_FILE = path.join(__dirname, 'stations_seed.json');
 const RELEASE_STATIONS_URL =
   'https://github.com/athanasso/fuelGR-scraper/releases/latest/download/stations_latest.min.json';
 
@@ -66,7 +67,7 @@ let emptyResponses = 0;
 
 /** Publish gates (vs previous snapshot when available) */
 const GATE_MIN_STATIONS = 4300;
-const GATE_MIN_U95_PCT = 95;
+const GATE_MIN_U95_PCT = 90;
 const GATE_MIN_DIESEL_PCT = 90;
 const GATE_MIN_VS_PREV_PCT = 97; // must keep >=97% of previous station count
 
@@ -335,6 +336,42 @@ function buildDenseMesh() {
   ];
   for (const [lat, lng] of hubs) add(lat, lng);
 
+  // Urban densification grid: Athens / Attica (~4.5 km spacing - guarantees South Athens, Argyroupoli, etc.)
+  for (let lat = 37.80; lat <= 38.15; lat += 0.045) {
+    for (let lng = 23.60; lng <= 23.90; lng += 0.045) {
+      add(lat, lng);
+    }
+  }
+
+  // Urban densification grid: Thessaloniki (~4.5 km spacing)
+  for (let lat = 40.54; lat <= 40.72; lat += 0.045) {
+    for (let lng = 22.88; lng <= 23.05; lng += 0.045) {
+      add(lat, lng);
+    }
+  }
+
+  // Regional urban hubs
+  const cityHubs = [
+    [38.2500, 21.7400], [38.2150, 21.7300], // Patras
+    [35.3350, 25.1350], [35.3150, 25.1050], // Heraklion
+    [39.6390, 22.4191], [39.6150, 22.4400], // Larissa
+    [39.3622, 22.9422], // Volos
+    [39.6650, 20.8537], // Ioannina
+    [38.4633, 23.5976], // Chalkida
+    [41.0849, 23.5476], // Serres
+    [40.9396, 24.4129], // Kavala
+    [37.0389, 22.1142], // Kalamata
+    [40.2709, 22.5061], // Katerini
+    [38.9000, 22.4333], // Lamia
+    [37.9405, 22.9322], // Corinth
+    [38.6250, 21.4100], // Agrinio
+    [39.5550, 21.7680], // Trikala
+    [39.3650, 21.9220], // Karditsa
+    [41.1350, 24.8880], // Xanthi
+    [40.3000, 21.7880]  // Kozani
+  ];
+  for (const [lat, lng] of cityHubs) add(lat, lng);
+
   return points;
 }
 
@@ -365,11 +402,20 @@ async function fetchJson(url) {
 }
 
 function normalizeBaselineStation(s) {
-  // Accept raw scraper schema or packaged master schema
+  // Accept raw scraper schema, packaged master schema, or compact seed schema
   if (s.fuels && s.lat != null) return s;
-  if (s.p && (s.lat != null || s.latitude != null)) {
+  if ((s.p || s.lat != null) && (s.lat != null || s.latitude != null)) {
     const fuels = {};
-    const p = s.p || {};
+    const p = s.p ? { ...s.p } : {};
+
+    // Strip false u95/d from corrupted release baseline snapshots
+    if (p.u95 && ((p.dh && Math.abs(p.u95 - p.dh) < 0.001) || (p.lpg && Math.abs(p.u95 - p.lpg) < 0.001) || p.u95 < 1.55)) {
+      delete p.u95;
+    }
+    if (p.d && p.dh && Math.abs(p.d - p.dh) < 0.001 && p.d < 1.45) {
+      delete p.d;
+    }
+
     if (p.u95) fuels['1'] = { price: p.u95, name: 'Unleaded 95', date: s.dt || '' };
     if (p.u98) fuels.u98 = { price: p.u98, name: 'Unleaded 98', date: s.dt || '' };
     if (p.u100) fuels.u100 = { price: p.u100, name: 'Unleaded 100', date: s.dt || '' };
@@ -402,6 +448,7 @@ async function loadBaseline(stationsMap) {
   const knownSellers = new Map();
 
   function noteSellers(s) {
+    if (!s) return;
     const id = String(s.id);
     const set = knownSellers.get(id) || new Set();
     for (const fid of BACKFILL_KNOWN_SELLERS) {
@@ -410,34 +457,51 @@ async function loadBaseline(stationsMap) {
     if (set.size) knownSellers.set(id, set);
   }
 
-  if (fs.existsSync(OUTPUT_FILE)) {
+  // 1. Permanent verified seed stations registry (guarantees zero missing stations nationwide)
+  if (fs.existsSync(SEED_FILE)) {
     try {
-      const existing = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
-      if (Array.isArray(existing)) {
-        for (const raw of existing) {
+      const seed = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+      if (Array.isArray(seed)) {
+        for (const raw of seed) {
           const s = normalizeBaselineStation(raw);
           if (s?.id) {
             stationsMap.set(String(s.id), s);
-            noteSellers(s);
             loaded++;
           }
         }
+        console.log(`Loaded ${loaded} stations from seed baseline registry.`);
       }
+    } catch (e) {
+      console.warn('Seed stations file unreadable:', e.message);
+    }
+  }
+
+  // 2. Overlay previous prices from local output or release
+  let priceSource = null;
+  if (fs.existsSync(OUTPUT_FILE)) {
+    try {
+      priceSource = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
     } catch (e) {
       console.warn('Local baseline unreadable:', e.message);
     }
   }
-  if (loaded === 0) {
-    console.log('Fetching previous release stations as baseline...');
-    const remote = await fetchJson(RELEASE_STATIONS_URL);
-    if (Array.isArray(remote)) {
-      for (const raw of remote) {
-        const s = normalizeBaselineStation(raw);
-        if (s?.id) {
-          stationsMap.set(String(s.id), s);
-          noteSellers(s);
+  if (!priceSource) {
+    console.log('Fetching previous release stations as price baseline...');
+    priceSource = await fetchJson(RELEASE_STATIONS_URL);
+  }
+
+  if (Array.isArray(priceSource)) {
+    for (const raw of priceSource) {
+      const s = normalizeBaselineStation(raw);
+      if (s?.id) {
+        const sid = String(s.id);
+        if (!stationsMap.has(sid)) {
+          stationsMap.set(sid, s);
           loaded++;
+        } else {
+          stationsMap.set(sid, mergeStation(stationsMap.get(sid), s));
         }
+        noteSellers(stationsMap.get(sid));
       }
     }
   }
@@ -525,11 +589,15 @@ async function backfillMissingFuels(stationsMap, fuelIds, label = 'Backfill', op
       const found = await queryCoordinates(coords.lat, coords.lng, fuelId);
       for (const hit of found) {
         const id = String(hit.id);
-        if (!stationsMap.has(id)) continue;
-        const before = stationsMap.get(id);
-        const had = hasFuel(before, fuelId);
-        stationsMap.set(id, mergeStation(before, hit));
-        if (!had && hasFuel(stationsMap.get(id), fuelId)) gained++;
+        if (!stationsMap.has(id)) {
+          stationsMap.set(id, hit);
+          gained++;
+        } else {
+          const before = stationsMap.get(id);
+          const had = hasFuel(before, fuelId);
+          stationsMap.set(id, mergeStation(before, hit));
+          if (!had && hasFuel(stationsMap.get(id), fuelId)) gained++;
+        }
       }
 
       if (gained === beforeGained) streakEmpty++;

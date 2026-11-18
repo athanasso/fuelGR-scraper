@@ -154,18 +154,40 @@ def extract_prices(raw: dict) -> dict:
             if k in FUEL_KEYS and isinstance(v, (int, float)) and v > 0:
                 prices[k] = round(float(v), 3)
 
-    if "u95" not in prices and raw.get("price") and raw.get("price") > 0:
-        ft = str(raw.get("fuel_type", "")).lower()
-        if "diesel" in ft:
-            prices["d"] = round(float(raw["price"]), 3)
-        elif "lpg" in ft or "autogas" in ft:
-            prices["lpg"] = round(float(raw["price"]), 3)
+    if not prices and raw.get("price") and raw.get("price") > 0:
+        pr = round(float(raw["price"]), 3)
+        ft = str(raw.get("fuel") or raw.get("fuel_type") or "").strip().lower()
+        if any(w in ft for w in ["θέρμανσ", "thermans", "heating", "dh"]):
+            prices["dh"] = pr
+        elif any(w in ft for w in ["lpg", "autogas", "υγραέρ", "gas"]):
+            prices["lpg"] = pr
+        elif any(w in ft for w in ["cng", "φυσικό αέριο"]):
+            prices["cng"] = pr
         elif "100" in ft:
-            prices["u100"] = round(float(raw["price"]), 3)
+            prices["u100"] = pr
         elif "98" in ft:
-            prices["u98"] = round(float(raw["price"]), 3)
-        else:
-            prices["u95"] = round(float(raw["price"]), 3)
+            prices["u98"] = pr
+        elif any(w in ft for w in ["diesel", "πετρέλαιο κίνησης"]) or ft == "d":
+            if is_premium_diesel_name(ft):
+                prices["dp"] = pr
+            else:
+                prices["d"] = pr
+        elif any(w in ft for w in ["95", "αμόλυβδη", "unleaded"]) or ft == "1":
+            prices["u95"] = pr
+        elif pr >= 1.60 and not ft:
+            prices["u95"] = pr
+
+    # Sanitize false u95/d masquerading: heating oil or LPG must never corrupt u95 or road diesel
+    if "u95" in prices:
+        if "dh" in prices and abs(prices["u95"] - prices["dh"]) < 0.001:
+            del prices["u95"]
+        elif "lpg" in prices and abs(prices["u95"] - prices["lpg"]) < 0.001:
+            del prices["u95"]
+        elif prices["u95"] < 1.55:
+            del prices["u95"]
+
+    if "d" in prices and "dh" in prices and abs(prices["d"] - prices["dh"]) < 0.001 and prices["d"] < 1.45:
+        del prices["d"]
 
     # Legacy dual-key bug: same type-4 price was written to both d and dp
     if (
@@ -198,6 +220,18 @@ def normalize_ledger(raw_ledger) -> dict[str, list[dict]]:
                 v = rec.get(k)
                 if isinstance(v, (int, float)) and v > 0:
                     row[k] = round(float(v), 3)
+
+            # Sanitize false u95/d masquerading from old buggy fallbacks
+            if "u95" in row:
+                if "dh" in row and abs(row["u95"] - row["dh"]) < 0.001:
+                    del row["u95"]
+                elif "lpg" in row and abs(row["u95"] - row["lpg"]) < 0.001:
+                    del row["u95"]
+                elif row["u95"] < 1.55:
+                    del row["u95"]
+            if "d" in row and "dh" in row and abs(row["d"] - row["dh"]) < 0.001 and row["d"] < 1.45:
+                del row["d"]
+
             if len(row) > 1:
                 cleaned.append(row)
         cleaned.sort(key=lambda r: r["date"])
@@ -484,6 +518,18 @@ def fill_price_gaps_from_ledger(
             v = rec.get(k)
             if isinstance(v, (int, float)) and v > 0:
                 out[k] = round(float(v), 3)
+
+    # Sanitize false u95/d masquerading: heating oil or LPG must never corrupt u95 or road diesel
+    if "u95" in out:
+        if "dh" in out and abs(out["u95"] - out["dh"]) < 0.001:
+            del out["u95"]
+        elif "lpg" in out and abs(out["u95"] - out["lpg"]) < 0.001:
+            del out["u95"]
+        elif out["u95"] < 1.55:
+            del out["u95"]
+    if "d" in out and "dh" in out and abs(out["d"] - out["dh"]) < 0.001 and out["d"] < 1.45:
+        del out["d"]
+
     return out
 
 
